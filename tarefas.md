@@ -1,0 +1,3 @@
+- Imprimir peças
+- Configuração inicial raspberry pi
+- Testes de speakers e microfone
