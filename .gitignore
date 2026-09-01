@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Editores / IDE
+.vscode/
+.idea/
+*.swp
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+
+# Logs e arquivos de teste locais
+*.log
+
+# Áudio gravado nos testes (etapas futuras) — fixtures versionadas ficam de fora
+*.wav
+!**/fixtures/*.wav
