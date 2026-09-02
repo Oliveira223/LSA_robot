@@ -1,0 +1,18 @@
+# Segredos — NUNCA versionar
+.env
+*.key
+
+# Ambiente virtual
+venv/
+.venv/
+
+# Cache do Python
+__pycache__/
+*.py[cod]
+
+# Áudio temporário
+*.wav
+audio_temp/
+
+# Sistema
+.DS_Store
