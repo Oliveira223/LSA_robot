@@ -1,16 +1,16 @@
 """
-testar_microfone.py — Diagnóstico do áudio antes de envolver a API.
+testar_microfone.py — Diagnóstico do microfone antes de plugar no pipeline.
 
-Uso:
-    python testar_microfone.py            # lista dispositivos e grava 5s
-    python testar_microfone.py 2          # força o dispositivo de índice 2
+Uso (a partir de src/):
+    python -m rasp.testar_microfone            # lista dispositivos e grava 5s
+    python -m rasp.testar_microfone 2          # força o dispositivo de índice 2
 """
 
 import sys
 
 import sounddevice as sd
 
-import audio
+from rasp import audio
 
 
 def mostrar_dispositivos():
@@ -77,9 +77,8 @@ def main():
 
     print("-" * 60)
     print(f"Arquivo gravado em: {caminho}")
-    print("Ouça com:  aplay teste_python.wav")
-    print("Ou traga para o seu PC com:")
-    print("  scp usuario@IP_DA_RASPBERRY:~/raspberry-assistant/teste_python.wav .")
+    print("Ouça com:  aplay teste_python.wav      (no Pi)")
+    print("           paplay teste_python.wav     (no PC, se aplay não existir)")
     return 0
 
 

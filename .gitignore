@@ -5,6 +5,10 @@ __pycache__/
 venv/
 *.egg-info/
 
+# Segredos — NUNCA versionar
+.env
+*.key
+
 # Editores / IDE
 .vscode/
 .idea/
@@ -16,7 +20,10 @@ Thumbs.db
 
 # Logs e arquivos de teste locais
 *.log
+audio_temp/
 
-# Áudio gravado nos testes (etapas futuras) — fixtures versionadas ficam de fora
+# Áudio gravado nos testes — fixtures versionadas ficam de fora
 *.wav
 !**/fixtures/*.wav
+
+.claude/

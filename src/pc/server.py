@@ -2,43 +2,42 @@
 server.py — servidor TCP de texto (etapa "a" do pipeline de comunicação).
 
 Escuta em HOST:PORTA, atende um cliente por vez e, para cada mensagem
-recebida, devolve uma resposta processada. Por enquanto o "processamento"
-e' so' texto.upper() — um placeholder do que mais tarde sera' a transcricao
-(STT) + IA rodando no PC.
+recebida, devolve uma resposta processada. Aqui o "processamento" é só
+texto.upper() — o servidor de verdade (áudio → transcrição → resposta)
+é o server_voz.py. Este arquivo continua existindo como o caso mínimo
+que valida o transporte (etapas a/b).
 
-Uso:
-    python notebook/server.py [host] [porta]
+Uso (a partir de src/):
+    python -m pc.server [host] [porta]
     (default: 127.0.0.1 5000)
 """
 
 from __future__ import annotations
 
-import os
 import socket
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "common"))
-from protocol import recv_msg, send_msg  # noqa: E402
+from common.protocol import recv_msg, send_texto
 
 
 def processar(texto: str) -> str:
-    """Placeholder da futura camada de STT + IA."""
+    """Placeholder do processamento real (ver server_voz.py)."""
     return texto.upper()
 
 
 def atender(conexao: socket.socket) -> None:
-    """Loop de mensagens de um cliente ja' conectado."""
+    """Loop de mensagens de um cliente já conectado."""
     while True:
         try:
-            texto = recv_msg(conexao)
+            msg = recv_msg(conexao)
         except (ConnectionResetError, ValueError) as e:
             print(f"[servidor] erro na conexao: {e}")
             return
-        if texto is None:
+        if msg is None:
             print("[servidor] cliente desconectou")
             return
-        print(f"[servidor] recebido: {texto!r}")
-        send_msg(conexao, processar(texto))
+        print(f"[servidor] recebido: {msg.texto!r}")
+        send_texto(conexao, processar(msg.texto))
 
 
 def main() -> None:
