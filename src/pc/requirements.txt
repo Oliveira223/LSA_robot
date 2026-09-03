@@ -1,1 +1,6 @@
+# Transcrição (pc/stt.py, pc/server_voz.py)
 faster-whisper>=1.0
+
+# Ferramenta local de captura+transcrição (pc/push_to_talk.py)
+sounddevice>=0.4.6
+numpy>=1.24

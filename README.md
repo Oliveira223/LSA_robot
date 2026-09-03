@@ -61,13 +61,25 @@ Detalhes dos dois modos (localhost e túnel SSH) em [docs/transporte.md](docs/tr
 
 ### Etapa (d) — áudio → texto → operador
 
-Dependências:
+Dependências (cada máquina só instala o que roda nela):
 
 ```bash
-pip install -r src/pc/requirements.txt     # no PC: faster-whisper
-pip install -r src/rasp/requirements.txt   # no Pi: sounddevice, numpy
-# no Pi real: sudo apt install -y libportaudio2
+# PC — faster-whisper. Se o pip reclamar de "externally-managed", use venv:
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r src/pc/requirements.txt
+
+# Raspberry Pi — no Raspberry Pi OS (PEP 668) o pip no Python do sistema é
+# bloqueado, e python3-sounddevice não está no apt. numpy vem do apt;
+# sounddevice (pequeno, puro Python) entra num venv que enxerga o sistema:
+sudo apt install -y python3-numpy libportaudio2
+python3 -m venv --system-site-packages ~/dev/LSA_robot/.venv
+~/dev/LSA_robot/.venv/bin/pip install sounddevice
+#   rodar com: ~/dev/LSA_robot/.venv/bin/python -m rasp.audio_client ...
+#   (libportaudio2 é obrigatório — é a lib C que o sounddevice usa em runtime)
 ```
+
+Enquanto o Pi está simulado no próprio notebook, essa máquina faz os dois
+papéis e precisa dos dois conjuntos.
 
 ```bash
 cd src
@@ -76,7 +88,25 @@ python3 -m rasp.audio_client 127.0.0.1 5000  # Pi: Enter para gravar 5 s, envia,
 ```
 
 A primeira execução do `server_voz` baixa o modelo do faster-whisper
-(`small` por padrão; `export LSA_WHISPER_MODEL=base` para um mais leve).
+(`small` por padrão; `export LSA_WHISPER_MODEL=base` — ou `tiny` — para um
+mais leve, útil em conexão ruim).
+
+### Ferramenta local — captura + transcrição
+
+Teste de microfone + transcrição numa máquina só, sem rede. Fica em loop:
+**ENTER** começa a gravar, **ENTER** de novo para, a frase transcrita aparece.
+`q` + ENTER (ou Ctrl-C) sai.
+
+```bash
+cd src
+python3 -m pc.push_to_talk            # microfone padrão
+python3 -m pc.push_to_talk 0          # forçar um índice de mic
+python3 -m pc.push_to_talk --list     # listar entradas de áudio
+```
+
+Precisa de `sounddevice`, `numpy` e `faster-whisper` (`src/pc/requirements.txt`).
+Lê o teclado do stdin normal do terminal — funciona em qualquer terminal,
+X11 ou Wayland, e por SSH.
 
 ## Setup no Raspberry Pi
 

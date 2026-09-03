@@ -214,8 +214,28 @@ o túnel SSH da etapa (b) como transporte.
   `server.py` (eco `.upper()`) fica como regressão das etapas (a)/(b).
 - `src/rasp/audio_client.py` — grava (reusa `audio.py`), pula se silencioso,
   envia o WAV, imprime `robo> ...`.
-- `requirements` separados: `src/pc/` (`faster-whisper`), `src/rasp/`
-  (`sounddevice`, `numpy`; no Pi real ainda `sudo apt install libportaudio2`).
+- `requirements` separados: `src/pc/` (`faster-whisper`, + `sounddevice`,
+  `numpy` para a ferramenta local abaixo), `src/rasp/` (`sounddevice`,
+  `numpy`; no Pi real ainda `sudo apt install libportaudio2`).
+- `src/pc/stt.py` ganhou `transcrever_array(amostras, taxa)` (sinal já em
+  memória, com reamostragem linear p/ 16 kHz) além de `transcrever(caminho)`.
+  Passou a forçar `HF_HUB_DISABLE_XET=1` por padrão — o backend "xet" da
+  HuggingFace trava em rede que corta conexão longa (visto na PUC).
+- `src/pc/push_to_talk.py` — ferramenta local (sem rede): ENTER grava, ENTER
+  para, transcreve, imprime a frase + `dur · pico · stt Ns`, em loop;
+  `q`/Ctrl-C sai. Um `Cronometro` (thread) mostra os segundos correndo na
+  mesma linha durante a gravação e durante a transcrição. Normaliza áudio
+  fraco antes do Whisper. Lê o stdin do terminal (sem `pynput`) — funciona
+  em X11, Wayland e SSH (o notebook está em sessão Wayland).
+- Tentativa de barra de progresso `%` descartada: o faster-whisper decodifica
+  áudio de até 30 s numa janela só e só entrega os segmentos no fim — para
+  clipes curtos o progresso pula de 0 % direto pro resultado. (O hook de
+  callback ficou em `stt._consumir` para uso futuro com áudio longo.)
+- `stt.transcribe` passou a usar `temperature=0`: sem a escada de "repete com
+  temperatura maior" quando o modelo fica inseguro (fala curta/pouco clara
+  chegava a 6-7× o tempo real). Latência mais previsível; `small` em CPU
+  fica ~3-4× o tempo do áudio — se precisar mais rápido, `LSA_WHISPER_MODEL=base`.
+- Idioma já fixo em `pt` no `transcribe` (pula a detecção automática).
 
 **O que funcionou / não funcionou**
 - ✅ Regressão do transporte de texto com o protocolo novo (byte de tipo),
@@ -224,17 +244,22 @@ o túnel SSH da etapa (b) como transporte.
   conecta depois do primeiro sair sem reiniciar o servidor.
 - ✅ Round-trip do protocolo em socketpair: AUDIO de ~100 KB binário volta
   idêntico; `.texto` em mensagem AUDIO levanta erro; fechamento limpo → `None`.
-- ✅ `import` de `common.protocol`, `pc.server`, `pc.server_voz`, `pc.stt`,
-  `rasp.client` a partir de `src/` (deps de `faster-whisper`/`sounddevice`
-  são carregadas só quando usadas).
-- ⏳ Não testado neste ambiente (faltam libs/hardware): `faster-whisper` de
-  verdade transcrevendo um WAV, captura de microfone, e o loop completo
-  `server_voz` ↔ `audio_client`. São os itens 2–4 da Verificação do plano.
+- ✅ venv no PC (Pop!_OS, PEP 668): `.venv` na raiz + `src/pc/requirements.txt`
+  + `src/rasp/requirements.txt` + `pynput` + `sudo apt install libportaudio2`.
+- ✅ Modelo `small` do faster-whisper baixou (a rede da PUC corta download
+  longo — `xet` falhou; HTTPS com retomada do `.incomplete` completou em
+  várias tentativas). Carrega e roda; `transcrever_array` + reamostragem
+  44100→16000 + normalização funcionam.
+- ⚠️ `pc.stt` devolveu `''` no `teste_python.wav`: a gravação estava
+  quase muda (RMS 27/32768, pico 0.034). Não é o código — é ganho de
+  captura do microfone no Pop!_OS. Normalizar 28x só amplifica ruído.
+- ⏳ Falta: microfone com ganho decente, e o loop completo
+  `server_voz` ↔ `audio_client` de ponta a ponta.
 
 **Próximo passo planejado**
-- Rodar aqui: instalar `src/pc/requirements.txt`, gravar um WAV com
-  `python3 -m rasp.testar_microfone`, transcrever com `python3 -m pc.stt`,
-  e o loop completo `server_voz` ↔ `audio_client` em localhost; depois pelo
+- Ajustar ganho de entrada do mic (Ajustes → Som, ou `alsamixer` F4) e
+  validar com `python3 -m pc.push_to_talk` (mirar pico > ~0.1).
+- Loop completo `server_voz` ↔ `audio_client` em localhost; depois pelo
   túnel SSH com o Pi.
 - Sub-etapas seguintes: TTS da resposta no Pi (`espeak-ng` ou `piper`);
   trocar o operador humano por regras + IA.
