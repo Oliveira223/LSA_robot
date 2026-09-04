@@ -1,4 +1,7 @@
-# Transcrição (pc/stt.py, pc/server_voz.py)
+# server.py e server_chat.py não têm dependência nenhuma (só biblioteca
+# padrão) — é o que roda hoje, sem microfone na Jetson.
+
+# Transcrição (pc/stt.py, pc/server_voz.py) — só quando a Jetson tiver mic
 faster-whisper>=1.0
 
 # Ferramenta local de captura+transcrição (pc/push_to_talk.py)

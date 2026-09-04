@@ -3,9 +3,10 @@ server.py — servidor TCP de texto (etapa "a" do pipeline de comunicação).
 
 Escuta em HOST:PORTA, atende um cliente por vez e, para cada mensagem
 recebida, devolve uma resposta processada. Aqui o "processamento" é só
-texto.upper() — o servidor de verdade (áudio → transcrição → resposta)
-é o server_voz.py. Este arquivo continua existindo como o caso mínimo
-que valida o transporte (etapas a/b).
+texto.upper() — o servidor de verdade é o server_chat.py (texto, operador
+humano no lugar da IA) ou, quando a Jetson tiver microfone, o
+server_voz.py (áudio → transcrição → resposta). Este arquivo continua
+existindo como o caso mínimo que valida o transporte (etapas a/b).
 
 Uso (a partir de src/):
     python -m pc.server [host] [porta]

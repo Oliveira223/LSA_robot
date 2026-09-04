@@ -1,15 +1,20 @@
 """
 server_voz.py — servidor da etapa (d): áudio → texto → resposta.
 
-Fluxo por mensagem recebida do Pi:
+Ainda não usado em produção: a Jetson atual não tem microfone. Fica pronto
+para quando o hardware chegar — até lá, pc/server_chat.py cobre a troca de
+mensagens usando só texto.
+
+Fluxo por mensagem recebida da Jetson:
   1. recebe um WAV (mensagem do tipo AUDIO);
   2. transcreve com faster-whisper (stt.transcrever);
   3. mostra a transcrição no terminal;
-  4. um OPERADOR HUMANO digita a resposta (simulando a IA);
-  5. devolve a resposta como texto para o Pi.
+  4. chama pc.cerebro.responder() — por ora um OPERADOR HUMANO digita a
+     resposta, simulando a IA;
+  5. devolve a resposta como texto para a Jetson.
 
 O passo 4 é o ponto que, mais adiante, vira uma chamada de IA de verdade
-(regras + modelo). Até lá, quem responde é a pessoa sentada neste terminal.
+(regras + modelo) — trocar pc/cerebro.py não exige mexer neste arquivo.
 
 Uso (a partir de src/):
     python -m pc.server_voz [host] [porta]
@@ -25,22 +30,7 @@ import tempfile
 
 from common.protocol import AUDIO, recv_msg, send_texto
 from pc import stt
-
-
-def responder(texto_ouvido: str) -> str:
-    """
-    Simula a IA: mostra o que foi ouvido e lê a resposta do operador.
-
-    Trocar esta função pela IA real não exige mexer no resto do arquivo.
-    """
-    print(f"\n[ouvido] {texto_ouvido!r}")
-    if not texto_ouvido:
-        print("[operador] (nada foi transcrito — o áudio pode estar sem fala)")
-    try:
-        return input("[operador] resposta> ")
-    except EOFError:
-        print()
-        return ""
+from pc.cerebro import responder
 
 
 def _transcrever_bytes(wav_bytes: bytes) -> str:
@@ -80,6 +70,8 @@ def atender(conexao: socket.socket) -> None:
             send_texto(conexao, "(desculpe, nao consegui entender o audio)")
             continue
 
+        if not texto:
+            print("[servidor] nada foi transcrito — o audio pode estar sem fala")
         send_texto(conexao, responder(texto))
 
 
