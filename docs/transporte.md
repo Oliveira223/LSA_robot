@@ -1,7 +1,7 @@
-# Transporte — camada de mensagens Rasp ↔ PC
+# Transporte — camada de mensagens Jetson ↔ PC
 
 Referência estável da parte que **já funciona e foi validada**: o canal
-TCP que leva texto (e, a partir da etapa d, áudio) entre o Raspberry Pi e
+TCP que leva texto (e, a partir da etapa d, áudio) entre a Jetson e
 o PC. O histórico datado de como se chegou aqui está em
 [`../PROGRESSO.md`](../PROGRESSO.md); este documento descreve o estado atual.
 
@@ -49,27 +49,31 @@ Sem dependências externas (só biblioteca padrão). A partir de `src/`:
 python3 -m pc.server                 # escuta em 127.0.0.1:5000
 
 # Terminal 2 — cliente de texto
-python3 -m rasp.client               # conecta em 127.0.0.1:5000
+python3 -m jetson.client             # conecta em 127.0.0.1:5000
 ```
 
-Host e porta são opcionais: `python3 -m rasp.client <host> <porta>`.
+Host e porta são opcionais: `python3 -m jetson.client <host> <porta>`.
 
-## Modo 2 — túnel SSH reverso PC ↔ Raspberry Pi (etapa b)
+Para um "chat" de verdade (operador do PC digita a resposta em vez de
+`.upper()`), troque `pc.server` por `pc.server_chat` — ver
+[`../README.md`](../README.md#etapa-d1--chat-de-texto-jetson--pc-sem-áudio-sem-dependências).
 
-O SSH já funciona no sentido PC → Pi. O túnel reverso (`-R`) reaproveita
-essa conexão: o Pi passa a escutar em `127.0.0.1:5000` e encaminha, por
+## Modo 2 — túnel SSH reverso PC ↔ Jetson (etapa b)
+
+O SSH já funciona no sentido PC → Jetson. O túnel reverso (`-R`) reaproveita
+essa conexão: a Jetson passa a escutar em `127.0.0.1:5000` e encaminha, por
 dentro do SSH, para o `127.0.0.1:5000` do PC.
 
 ```bash
 # No PC, terminal 1
 python3 -m pc.server
 
-# No PC, terminal 2 — abre shell no Pi + túnel reverso da porta 5000
-ssh -R 5000:localhost:5000 <user>@<ip-do-pi>
+# No PC, terminal 2 — abre shell na Jetson + túnel reverso da porta 5000
+ssh -R 5000:localhost:5000 <user>@<ip-da-jetson>
 
-# Já dentro do Pi (pela sessão acima)
+# Já dentro da Jetson (pela sessão acima)
 cd ~/dev/LSA_robot/src
-python3 -m rasp.client 127.0.0.1 5000
+python3 -m jetson.client 127.0.0.1 5000
 ```
 
 Nenhuma mudança de código entre os modos — só o destino do socket.
@@ -85,8 +89,10 @@ Nos modos 1 e 2, com `pc.server` (eco `.upper()`):
 - fechar e reabrir o cliente sem derrubar o servidor (`SO_REUSEADDR` + `listen(1)`).
 
 Observação da etapa (b): a primeira tentativa de `ssh` falhou com
-`No route to host` porque o Pi trocou de IP via DHCP. Reservar IP fixo
-para o Pi no roteador resolve — e é pré-requisito da etapa (c).
+`No route to host` porque a Jetson trocou de IP via DHCP (isso foi na época
+em que a placa ainda era um Raspberry Pi; a observação vale igual na
+Jetson). Reservar IP fixo para a Jetson no roteador resolve — e é
+pré-requisito da etapa (c).
 
 ## Etapa (c) — WiFi direto: adiada
 

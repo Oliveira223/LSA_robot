@@ -1,4 +1,4 @@
-# PROGRESSO — Pipeline de comunicação Rasp ↔ PC
+# PROGRESSO — Pipeline de comunicação Jetson ↔ PC
 
 Log cronológico do projeto de comunicação (áudio → PC → texto → voz).
 Cada entrada: data, o que foi tentado, o que funcionou / não funcionou,
@@ -6,15 +6,18 @@ decisões importantes, próximo passo.
 
 Ordem de progressão planejada:
 - **(a)** dois terminais no mesmo notebook (localhost), só texto, via socket
-- **(b)** mesmo código, via túnel SSH entre notebook e Raspberry Pi
+- **(b)** mesmo código, via túnel SSH entre notebook e a placa do robô
 - **(c)** mesmo código, via WiFi direto (IP real na rede local)
   — _adiada: rede da PUC tem isolamento de clientes; usando o túnel SSH da (b)_
 - **(d)** integração de áudio (captura, envio, transcrição, TTS)
+  — _dividida em (d1) chat de texto e (d2) áudio de verdade, ver entrada de 2026-09-04_
 
-> Nota: os caminhos citados nas entradas antigas (`common/`, `notebook/`,
-> `rasp/`) valiam na data delas. Desde **2026-09-03** o código está sob
-> `src/{common,pc,rasp}/` — ver a entrada dessa data e
-> [`docs/transporte.md`](docs/transporte.md) para os caminhos atuais.
+> Nota: os caminhos e nomes citados nas entradas antigas (`common/`,
+> `notebook/`, `rasp/`) valiam na data delas. Desde **2026-09-03** o código
+> está sob `src/{common,pc,rasp}/`; desde **2026-09-04** a placa do robô é
+> uma **Jetson** (não mais um Raspberry Pi) e `src/rasp/` virou
+> `src/jetson/` — ver a entrada de 2026-09-04 e
+> [`docs/transporte.md`](docs/transporte.md) para os caminhos e nomes atuais.
 
 ---
 
@@ -260,6 +263,68 @@ o túnel SSH da etapa (b) como transporte.
 - Ajustar ganho de entrada do mic (Ajustes → Som, ou `alsamixer` F4) e
   validar com `python3 -m pc.push_to_talk` (mirar pico > ~0.1).
 - Loop completo `server_voz` ↔ `audio_client` em localhost; depois pelo
-  túnel SSH com o Pi.
-- Sub-etapas seguintes: TTS da resposta no Pi (`espeak-ng` ou `piper`);
-  trocar o operador humano por regras + IA.
+  túnel SSH com a placa do robô.
+- Sub-etapas seguintes: TTS da resposta na placa do robô (`espeak-ng` ou
+  `piper`); trocar o operador humano por regras + IA.
+
+---
+
+## 2026-09-04
+
+### Troca de hardware: Raspberry Pi → Jetson
+
+**O que foi feito**
+- A placa dentro da cabeça do robô deixou de ser um Raspberry Pi e passou a
+  ser uma **Jetson**. `src/rasp/` → `src/jetson/` (`git mv`); todo import,
+  docstring, comentário e doc que citava "Raspberry Pi"/"Rasp"/"Pi" nos
+  arquivos ativos (`src/`, `docs/`, `README.md`) foi atualizado para
+  "Jetson". Entradas antigas deste log (datadas) não foram reescritas —
+  valiam para o hardware da época, ver nota no topo do arquivo.
+- `experiments/audio_openai/` (spike parado, fora do caminho atual) só
+  ganhou as correções de referência que quebrariam de fato (o caminho
+  `src/rasp/audio.py` citado no README) — os comentários de desempenho
+  específicos do Pi 3 antigo (ex.: custo de handshake TLS) foram deixados
+  como estão, por serem uma observação histórica daquele hardware.
+
+**Decisões importantes**
+- **Ainda não há microfone nem alto-falante na Jetson.** Em vez de esperar
+  o hardware de áudio chegar para ter algo testável, a etapa (d) foi
+  dividida:
+  - **(d1)** um "chat" de **texto puro** Jetson ↔ PC — sem nenhuma
+    dependência nova, reaproveitando `jetson/client.py` (etapas a/b) e um
+    novo `pc/server_chat.py` no lugar do eco `.upper()`.
+  - **(d2)** o pipeline de áudio de verdade (`server_voz.py` +
+    `audio_client.py`), que já existia e fica como está, aguardando o
+    microfone.
+- **Extraída a camada de resposta para `pc/cerebro.py`.** A função
+  `responder(texto) -> texto` (hoje: imprime a mensagem e lê a resposta
+  digitada por um operador humano no PC — o "outro usuário" da conversa)
+  estava duplicada dentro de `server_voz.py`. Agora mora só em
+  `pc/cerebro.py` e é chamada tanto por `server_chat.py` (texto) quanto por
+  `server_voz.py` (texto já transcrito de áudio). Isso significa que:
+  - trocar áudio por texto (ou vice-versa) é só trocar de servidor —
+    nenhum dos dois sabe como a mensagem chegou;
+  - trocar o operador humano pela IA de verdade é mexer só em
+    `pc/cerebro.py`, sem tocar em nenhum dos dois servidores — ver
+    [`docs/roadmap-ia-conversacional.md`](docs/roadmap-ia-conversacional.md).
+- **O máximo do trabalho continua no PC.** `jetson/client.py` não mudou:
+  ele já era o cliente mínimo (lê teclado, manda, mostra resposta) desde a
+  etapa (a). O PC é quem ganhou o novo servidor e a camada de "cérebro".
+
+**O que funcionou / não funcionou**
+- ✅ `pc.server_chat` + `jetson.client` em localhost: mensagem digitada na
+  Jetson chega ao PC, resposta digitada pelo operador volta e aparece no
+  terminal da Jetson — mesmo comportamento de ida-e-volta já validado nas
+  etapas (a)/(b), agora com um humano respondendo em vez de `.upper()`.
+- ✅ `server_voz.py` importa `responder` de `pc.cerebro` em vez de definir a
+  própria função — comportamento equivalente ao anterior, com um aviso
+  extra no terminal do servidor quando a transcrição vier vazia (antes essa
+  mensagem estava embutida na função de resposta; agora é um print à parte
+  em `server_voz.py`, já que é específico de áudio).
+
+**Próximo passo planejado**
+- Rodar `pc.server_chat` ↔ `jetson.client` pelo túnel SSH com a Jetson de
+  verdade (mesmo modelo das etapas a/b), não só em localhost.
+- Quando o microfone/speaker chegar na Jetson: validar (d2) de ponta a
+  ponta e então trocar `pc/cerebro.py` por regras + IA (fases 1-3 do
+  roadmap de IA conversacional).
