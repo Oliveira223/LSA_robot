@@ -132,7 +132,7 @@ def transcrever(caminho_wav):
     except openai.APIConnectionError as erro:
         raise ErroDaAPI(
             "Não foi possível conectar à API da OpenAI.\n"
-            "Verifique a internet da Raspberry com:  ping -c 3 api.openai.com"
+            "Verifique a internet da Jetson com:  ping -c 3 api.openai.com"
         ) from erro
 
     except openai.APIStatusError as erro:

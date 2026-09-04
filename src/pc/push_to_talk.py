@@ -13,7 +13,7 @@ inclusive por SSH.
 
 Não usa rede nem socket: é só microfone → faster-whisper → terminal. Serve
 para validar captação + transcrição numa máquina só, antes de plugar no
-pipeline (pc/server_voz.py + rasp/audio_client.py).
+pipeline (pc/server_voz.py + jetson/audio_client.py).
 
 Uso (a partir de src/):
     python -m pc.push_to_talk [indice_do_microfone]

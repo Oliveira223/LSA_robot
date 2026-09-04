@@ -2,15 +2,16 @@
 client.py — cliente TCP de texto (etapa "a" do pipeline de comunicacao).
 
 Conecta em HOST:PORTA, le' linhas do teclado, envia cada uma como uma
-mensagem e imprime a resposta do servidor. Roda no Raspberry Pi (ou
-simulado no PC); por isso host e porta sao argumentos, e nao valores fixos.
+mensagem e imprime a resposta do servidor. Roda na Jetson (ou simulado no
+PC); por isso host e porta sao argumentos, e nao valores fixos.
 
 O cliente de voz (grava do microfone em vez de ler do teclado) e' o
 audio_client.py. Este arquivo continua como o caso minimo de teste do
-transporte.
+transporte, e e' a base do modo "chat" (pc/server_chat.py) enquanto a
+Jetson nao tem microfone.
 
 Uso (a partir de src/):
-    python -m rasp.client [host] [porta]
+    python -m jetson.client [host] [porta]
     (default: 127.0.0.1 5000)
 """
 

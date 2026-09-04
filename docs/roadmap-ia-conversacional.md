@@ -2,12 +2,12 @@
 
 Objetivo final: depois que o PC transcreve a fala (Whisper), o texto não deve só ser
 repetido — uma IA precisa **interpretar** e **gerar uma resposta**, que depois é
-convertida em voz. Tudo isso rodando no PC ou via API, para manter o Raspberry
+convertida em voz. Tudo isso rodando no PC ou via API, para manter a Jetson
 apenas como "boca e ouvido" do robô (captura de áudio + reprodução), sem processar
 IA pesada nele.
 
 ```
-[Texto transcrito] → [IA interpreta e responde] → [texto de resposta] → volta pro Rasp → TTS
+[Texto transcrito] → [IA interpreta e responde] → [texto de resposta] → volta pra Jetson → TTS
 ```
 
 Este roadmap assume que a Fase 3 do pipeline de áudio (áudio chegando no PC) já
@@ -25,7 +25,7 @@ Antes de codar, decida a estratégia (dá pra trocar depois, mas evita retrabalh
 | **Modelo local no PC** (ex: Llama/Mistral via Ollama) | Funciona offline, sem custo por request | Precisa de PC com GPU decente pra ser rápido, qualidade pode ser inferior |
 | **Híbrido** | Local pra respostas simples/rápidas, API pra perguntas complexas | Mais complexo de implementar |
 
-Para o Raspberry ficar o mais leve possível, ele **nunca** deve rodar o modelo — só
+Para a Jetson ficar o mais leve possível, ela **nunca** deve rodar o modelo — só
 manda texto e recebe texto. Essa decisão é só sobre onde a IA roda: no PC ou na nuvem.
 
 ✅ **Critério de sucesso:** decisão tomada e anotada (pode começar com API pra prototipar rápido, e migrar pra local depois se quiser independência de internet).
@@ -37,14 +37,14 @@ manda texto e recebe texto. Essa decisão é só sobre onde a IA roda: no PC ou 
 **Objetivo:** confirmar que dá pra plugar uma "camada de IA" no meio do pipeline sem quebrar nada, antes de gastar tempo com IA de verdade.
 
 - [ ] No PC, criar uma função `gerar_resposta(texto) -> texto` que só devolve algo fixo ou um eco
-- [ ] Conectar essa função entre a transcrição (Whisper) e o envio de volta pro Rasp
+- [ ] Conectar essa função entre a transcrição (Whisper) e o envio de volta pra Jetson
 
 ```python
 def gerar_resposta(texto_usuario: str) -> str:
     return f"Você disse: {texto_usuario}. Ainda estou aprendendo a responder de verdade."
 ```
 
-✅ **Critério de sucesso:** o pipeline completo (fala → Whisper → função fake → texto → Rasp fala) funciona de ponta a ponta.
+✅ **Critério de sucesso:** o pipeline completo (fala → Whisper → função fake → texto → Jetson fala) funciona de ponta a ponta.
 
 ---
 
@@ -192,4 +192,4 @@ def gerar_resposta_ia(texto_usuario: str) -> str:
 | 5 | Alternativa local via Ollama (offline / sem custo) |
 | 6 | Estratégia híbrida combinando regras + local + API |
 
-**Lembrete central:** em todas as fases, o Raspberry só manda texto e recebe texto — a IA nunca roda nele. Isso mantém o robô leve e a "inteligência" centralizada e fácil de trocar/melhorar sem mexer no hardware da cabeça.
+**Lembrete central:** em todas as fases, a Jetson só manda texto e recebe texto — a IA nunca roda nela. Isso mantém o robô leve e a "inteligência" centralizada e fácil de trocar/melhorar sem mexer no hardware da cabeça.

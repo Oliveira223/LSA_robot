@@ -2,15 +2,15 @@
 testar_microfone.py — Diagnóstico do microfone antes de plugar no pipeline.
 
 Uso (a partir de src/):
-    python -m rasp.testar_microfone            # lista dispositivos e grava 5s
-    python -m rasp.testar_microfone 2          # força o dispositivo de índice 2
+    python -m jetson.testar_microfone            # lista dispositivos e grava 5s
+    python -m jetson.testar_microfone 2          # força o dispositivo de índice 2
 """
 
 import sys
 
 import sounddevice as sd
 
-from rasp import audio
+from jetson import audio
 
 
 def mostrar_dispositivos():
@@ -77,7 +77,7 @@ def main():
 
     print("-" * 60)
     print(f"Arquivo gravado em: {caminho}")
-    print("Ouça com:  aplay teste_python.wav      (no Pi)")
+    print("Ouça com:  aplay teste_python.wav      (na Jetson)")
     print("           paplay teste_python.wav     (no PC, se aplay não existir)")
     return 0
 

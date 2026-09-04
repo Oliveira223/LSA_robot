@@ -14,7 +14,7 @@ O pipeline atual (etapa d) usa transcrição **local/offline** com
 
 | Arquivo | O quê |
 |---|---|
-| `audio.py` original | foi promovido para [`../../src/rasp/audio.py`](../../src/rasp/audio.py) (captura de mic, reusado no projeto) |
+| `audio.py` original | foi promovido para [`../../src/jetson/audio.py`](../../src/jetson/audio.py) (captura de mic, reusado no projeto; na época do Raspberry Pi morava em `src/rasp/`) |
 | `openai_client.py` | chamadas à API de transcrição da OpenAI, com tratamento de erro por tipo |
 | `config.py` | leitura de `OPENAI_API_KEY`, nomes de modelo, timeouts |
 | `testar_transcricao.py` | grava uma frase e imprime a transcrição (usa `audio.py` + `openai_client.py`) |
@@ -22,7 +22,7 @@ O pipeline atual (etapa d) usa transcrição **local/offline** com
 | `requirements.txt` | `openai`, `sounddevice`, `numpy`, `python-dotenv` |
 
 Nota: `testar_transcricao.py` importa `audio`, que não está mais nesta
-pasta. Se for reativar, aponte para `src/rasp/audio.py` ou copie de volta.
+pasta. Se for reativar, aponte para `src/jetson/audio.py` ou copie de volta.
 
 ## Quando isso pode voltar
 

@@ -1,9 +1,9 @@
-# Roadmap — Pipeline de Áudio Rasp ↔ PC (Robô)
+# Roadmap — Pipeline de Áudio Jetson ↔ PC (Robô)
 
-Objetivo final: Raspberry Pi (dentro da cabeça do robô) captura áudio, envia por WiFi para o PC, que processa e devolve texto; o Rasp converte esse texto em voz e toca no speaker.
+Objetivo final: Jetson (dentro da cabeça do robô) captura áudio, envia por WiFi para o PC, que processa e devolve texto; a Jetson converte esse texto em voz e toca no speaker.
 
 ```
-[Mic no Rasp] → WiFi → [PC: STT] → texto → WiFi → [Rasp: TTS] → [Speaker]
+[Mic na Jetson] → WiFi → [PC: STT] → texto → WiFi → [Jetson: TTS] → [Speaker]
 ```
 
 A estratégia é validar cada camada isoladamente antes de integrar. Cada fase tem um critério de sucesso claro — só avance quando a fase anterior estiver 100% estável.
@@ -13,12 +13,12 @@ A estratégia é validar cada camada isoladamente antes de integrar. Cada fase t
 ## Fase 0 — Preparação de rede
 
 **O que fazer:**
-- Conectar Rasp e PC na mesma rede WiFi.
-- Configurar IP fixo (ou reserva DHCP no roteador) para o Rasp, para não perder o endereço a cada reboot.
+- Conectar Jetson e PC na mesma rede WiFi.
+- Configurar IP fixo (ou reserva DHCP no roteador) para a Jetson, para não perder o endereço a cada reboot.
 - Testar conectividade básica.
 
 ```bash
-# No Rasp
+# Na Jetson
 hostname -I
 
 # No PC
@@ -33,22 +33,22 @@ ping <IP_DO_RASP>
 
 **O que fazer:**
 - Criar um servidor socket TCP simples no PC.
-- Criar um cliente socket no Rasp que manda texto digitado manualmente.
+- Criar um cliente socket na Jetson que manda texto digitado manualmente.
 - PC processa (mesmo que seja só `.upper()` por enquanto) e devolve resposta.
 
 **Por que pular o netcat puro:** você vai precisar de um protocolo próprio (indicar tamanho do payload, tipo de mensagem) — melhor já estruturar isso em Python desde o início.
 
-**Critério de sucesso:** mensagem digitada no Rasp chega no PC, resposta processada volta pro Rasp, sem travar ou corromper dados.
+**Critério de sucesso:** mensagem digitada na Jetson chega no PC, resposta processada volta pra Jetson, sem travar ou corromper dados.
 
 ---
 
 ## Fase 2 — Áudio local (sem rede ainda)
 
 **O que fazer:**
-- No Rasp: testar captura de microfone (`arecord`, depois `sounddevice`/`pyaudio` em Python). Gravar em 16kHz mono (suficiente pra voz, mais leve pra transmitir).
+- Na Jetson: testar captura de microfone (`arecord`, depois `sounddevice`/`pyaudio` em Python). Gravar em 16kHz mono (suficiente pra voz, mais leve pra transmitir).
 - No PC: testar transcrição local com um arquivo `.wav` copiado manualmente (via `scp`), usando `faster-whisper`.
 
-**Critério de sucesso:** grava no Rasp → copia manualmente pro PC → Whisper transcreve corretamente.
+**Critério de sucesso:** grava na Jetson → copia manualmente pro PC → Whisper transcreve corretamente.
 
 ---
 
@@ -58,7 +58,7 @@ ping <IP_DO_RASP>
 - Unir Fase 1 + Fase 2: em vez de `scp` manual, enviar os bytes do `.wav` via socket.
 - Importante: mandar o **tamanho do arquivo primeiro** (ex: 8 bytes) antes dos dados, porque TCP não garante que tudo chegue num único `recv()` — sem isso o arquivo pode chegar cortado.
 
-**Critério de sucesso:** arquivo gravado no Rasp chega íntegro no PC (mesmo checksum/mesma duração) e toca normalmente no PC.
+**Critério de sucesso:** arquivo gravado na Jetson chega íntegro no PC (mesmo checksum/mesma duração) e toca normalmente no PC.
 
 ---
 
@@ -66,9 +66,9 @@ ping <IP_DO_RASP>
 
 **O que fazer:**
 - PC recebe áudio, roda `faster-whisper`, devolve o texto transcrito pelo mesmo socket (ou nova conexão).
-- Rasp recebe o texto e sintetiza voz localmente.
+- Jetson recebe o texto e sintetiza voz localmente.
 
-**Opções de TTS no Rasp (do mais leve ao mais pesado):**
+**Opções de TTS na Jetson (do mais leve ao mais pesado):**
 - `espeak-ng` — robótico, muito leve, roda sem esforço no Pi. Combina até com estética de robô.
 - `piper` — TTS neural, leve o suficiente pro Pi, com vozes bem mais naturais que espeak.
 
@@ -79,7 +79,7 @@ ping <IP_DO_RASP>
 ## Fase 5 — Streaming em tempo real (avançado, opcional)
 
 **O que fazer (depois que o fluxo em lote estiver 100% estável):**
-- Implementar detecção de silêncio/VAD (voice activity detection) no Rasp, para só enviar áudio quando alguém está falando, em vez de gravar blocos fixos de tempo.
+- Implementar detecção de silêncio/VAD (voice activity detection) na Jetson, para só enviar áudio quando alguém está falando, em vez de gravar blocos fixos de tempo.
 - Considerar WebSockets em vez de TCP puro para facilitar streaming contínuo.
 - Avaliar UDP para o áudio bruto se latência for mais crítica que garantia de entrega (com cuidado — pode perder pacotes).
 
@@ -102,5 +102,5 @@ ping <IP_DO_RASP>
 
 - **Sempre mande o tamanho do payload antes dos dados** em qualquer transferência via TCP.
 - **16kHz mono** é o padrão recomendado para voz — reduz banda sem perder qualidade de reconhecimento.
-- **IP fixo no Rasp** evita dor de cabeça recorrente com scripts que hardcodeiam endereço.
+- **IP fixo na Jetson** evita dor de cabeça recorrente com scripts que hardcodeiam endereço.
 - Teste cada fase isoladamente antes de integrar — facilita MUITO o debug quando algo quebra.

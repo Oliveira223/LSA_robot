@@ -1,3 +1,3 @@
 - Imprimir peças
-- Configuração inicial raspberry pi
+- Configuração inicial jetson
 - Testes de speakers e microfone

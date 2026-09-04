@@ -1,5 +1,5 @@
 """
-audio.py — Captura de áudio do microfone da Raspberry Pi.
+audio.py — Captura de áudio do microfone da Jetson.
 
 Responsabilidades deste módulo:
   - localizar um dispositivo de entrada válido;
@@ -8,6 +8,9 @@ Responsabilidades deste módulo:
   - salvar em WAV (16-bit mono, formato aceito pela API da OpenAI);
   - detectar gravações silenciosas antes de gastar chamada de API;
   - apagar arquivos temporários.
+
+Ainda não usado em produção: a Jetson atual não tem microfone plugado.
+Fica pronto para quando o hardware chegar (ver jetson/audio_client.py).
 """
 
 import os
@@ -20,7 +23,7 @@ import sounddevice as sd
 # --- Constantes de formato de áudio ---------------------------------------
 # 16 kHz é o padrão para voz: cobre toda a faixa da fala humana (até ~8 kHz,
 # pelo teorema de Nyquist) e gera arquivos 3x menores que 48 kHz. Menos bytes
-# significa upload mais rápido, o que importa bastante numa Pi 3 no Wi-Fi.
+# significa upload mais rápido, o que importa bastante numa Jetson no Wi-Fi.
 TAXA_PREFERIDA = 16000
 CANAIS = 1              # mono
 LARGURA_AMOSTRA = 2     # 2 bytes por amostra = int16
@@ -189,8 +192,9 @@ def esta_silencioso(rms, limiar=LIMIAR_SILENCIO):
 
 def remover_arquivo(caminho):
     """
-    Apaga o WAV temporário. Importante na Pi: o cartão SD tem espaço limitado
-    e um número finito de ciclos de escrita. Nunca deixe lixo acumulando.
+    Apaga o WAV temporário. Importante na Jetson: o armazenamento (cartão SD
+    ou eMMC, dependendo do modelo) tem espaço limitado e um número finito de
+    ciclos de escrita. Nunca deixe lixo acumulando.
     """
     try:
         if caminho and os.path.exists(caminho):
