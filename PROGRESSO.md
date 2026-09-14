@@ -328,3 +328,65 @@ o túnel SSH da etapa (b) como transporte.
 - Quando o microfone/speaker chegar na Jetson: validar (d2) de ponta a
   ponta e então trocar `pc/cerebro.py` por regras + IA (fases 1-3 do
   roadmap de IA conversacional).
+
+---
+
+## 2026-09-08
+
+### Etapa (d1) validada na Jetson
+
+- ✅ `pc.server_chat` ↔ `jetson.client` rodou na Jetson de verdade por
+  conexão local (não só em localhost no notebook): mensagem digitada na
+  Jetson chega ao PC, o operador responde, a resposta aparece na Jetson.
+  Fecha a etapa (d1).
+
+### Etapa (d2) — áudio nos dois sentidos, testando em localhost no PC
+
+**Decisão: a síntese de voz (TTS) roda no PC, não na Jetson.** O roadmap
+original mandava a Jetson sintetizar. Mudou para manter a Jetson só como
+"ouvido e boca": a voz do robô fica ao lado do "cérebro" (`pc/cerebro.py`),
+trocável sem tocar no hardware da cabeça, e o protocolo já leva `AUDIO` nos
+dois sentidos — devolver um WAV curto é simétrico ao áudio que a Jetson já
+manda. Ver [`docs/roadmap-comunicacao.md`](docs/roadmap-comunicacao.md) (Fase 4).
+
+**O que foi feito**
+- `src/common/audio_io.py` (novo) — captura e reprodução compartilhadas
+  entre `jetson/audio_client.py` e `pc/push_to_talk.py`. Contém o `Gravador`
+  de duração variável (ENTER começa / ENTER para, sem VAD) e o `Cronometro`,
+  antes só dentro de `push_to_talk.py`; mais `array_para_wav_bytes` e
+  `tocar_wav_bytes` (ponte com o protocolo, que carrega WAV). Depende de
+  sounddevice + numpy — fica em `common/` mas `protocol.py` continua sem
+  dependência (quem só troca texto não importa `audio_io`).
+- `src/pc/tts.py` (novo) — `sintetizar(texto) -> bytes` (WAV) via `espeak-ng`
+  (voz `pt-br`, `LSA_TTS_VOZ` / `LSA_TTS_WPM` para ajustar). Isolado como o
+  `stt.py`: trocar por `piper` depois é mexer só aqui. `espeak-ng` é pacote
+  apt, sem modelo para baixar — evita repetir o problema do xet do whisper
+  na rede da PUC.
+- `src/pc/server_voz.py` — depois de `cerebro.responder()`, sintetiza a
+  resposta e manda como `AUDIO` (`send_audio`). Se `espeak-ng` não estiver
+  instalado, cai para `send_texto` (fallback) e avisa no start.
+- `src/jetson/audio_client.py` — reescrito: captura via `audio_io.Gravador`
+  (ENTER/ENTER, duração variável) no lugar dos 5 s fixos; a resposta agora
+  é `AUDIO` e toca com `tocar_wav_bytes`; se vier `TEXTO` (fallback), só
+  imprime. 3º argumento opcional = índice do microfone.
+- `src/pc/push_to_talk.py` — passou a importar `Gravador`/`Cronometro` de
+  `common.audio_io` (fim da duplicação); comportamento igual.
+- `src/jetson/audio.py` — mantido como está (captura por duração fixa),
+  ainda usado pelo seu autoteste e por `testar_microfone.py`.
+- `requirements` do PC: nota que `espeak-ng` é apt, não pip.
+
+**O que funcionou / não funcionou**
+- ✅ Testes offline (sem mic, sem espeak-ng): `array_para_wav_bytes` gera
+  WAV PCM 16-bit 16 kHz mono válido; round-trip pelo `protocol` (socketpair)
+  devolve os bytes idênticos; `.texto` numa mensagem `AUDIO` levanta
+  `ValueError`; `tts.sintetizar('')` → `ErroDeTTS`; `server_voz` sobe, avisa
+  da falta do `espeak-ng`, ignora mensagem de tipo errado e trata desconexão.
+- ⏳ Falta rodar o loop completo com microfone e alto-falante reais no PC
+  (fala → transcrição → resposta digitada → voz tocada), e instalar
+  `espeak-ng` (`sudo apt install -y espeak-ng`) para sair do fallback de texto.
+
+**Próximo passo planejado**
+- `sudo apt install -y espeak-ng` no PC; rodar `pc.server_voz` ↔
+  `jetson.audio_client` em localhost e validar o ciclo de voz de ponta a ponta.
+- Depois: mesmo loop pelo túnel SSH quando a Jetson tiver mic/speaker;
+  então trocar `pc/cerebro.py` por regras + IA.

@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# camera-simples - gerencia a tela da PrimeSense (Camera_Simples.py: RGB em
+# tela cheia + profundidade em miniatura + bounding box de rosto via YOLO)
+# na tela fisica da Jetson (HDMI, DISPLAY :1).
+#
+#   ./camera-simples            reinicia (para + reseta USB + abre de novo)
+#   ./camera-simples start      so abre (nao mexe em processo/USB antes)
+#   ./camera-simples stop       fecha e libera o sensor
+#   ./camera-simples status     mostra se esta rodando
+#
+# Qualquer argumento extra e repassado pro Camera_Simples.py, ex:
+#   ./camera-simples start --no-faces      desliga a deteccao de rosto
+#   ./camera-simples start --face-size 128 deteccao mais rapida/menos precisa
+#
+# Por que precisa disso em vez de so matar o processo: nessa Jetson, um
+# 'kill' comum (SIGTERM) no Camera_Simples.py NAO retorna (visto na pratica:
+# a chamada bloqueante do OpenNI2/GTK nao responde ao sinal) e, pior, deixa
+# o sensor PrimeSense num estado travado — a proxima tentativa de abrir a
+# camera fica pendurada indefinidamente. A unica saida confiavel encontrada:
+# matar com -9 e dar um reset USB por software (ioctl USBDEVFS_RESET) antes
+# de abrir de novo. Esse script automatiza os dois passos.
+set -u
+
+DISP=":1"
+APPDIR="$HOME/dev/Camera-prime-sense"
+PY="$APPDIR/venv/bin/python"
+APP="$APPDIR/Camera_Simples.py"
+LOG="/tmp/camera-simples.log"
+USB_VENDOR="1d27"
+USB_PRODUCT="0601"
+
+for f in "$HOME/.Xauthority" "/run/user/$(id -u)/gdm/Xauthority"; do
+    [ -f "$f" ] && { export XAUTHORITY="$f"; break; }
+done
+export DISPLAY="$DISP"
+
+achar_dispositivo_usb() {
+    local d vendor product bus dev
+    for d in /sys/bus/usb/devices/*/; do
+        vendor="$(cat "${d}idVendor" 2>/dev/null)"
+        product="$(cat "${d}idProduct" 2>/dev/null)"
+        if [ "$vendor" = "$USB_VENDOR" ] && [ "$product" = "$USB_PRODUCT" ]; then
+            bus="$(cat "${d}busnum" 2>/dev/null)"
+            dev="$(cat "${d}devnum" 2>/dev/null)"
+            [ -n "$bus" ] && [ -n "$dev" ] && printf '/dev/bus/usb/%03d/%03d\n' "$bus" "$dev" && return 0
+        fi
+    done
+    return 1
+}
+
+resetar_usb() {
+    local caminho
+    caminho="$(achar_dispositivo_usb)" || { echo "AVISO: PrimeSense nao encontrada no USB (pulei o reset)." >&2; return 0; }
+    python3 -c "
+import fcntl, os, sys
+try:
+    fd = os.open('$caminho', os.O_WRONLY)
+    fcntl.ioctl(fd, 0x5514, 0)  # USBDEVFS_RESET
+    os.close(fd)
+except Exception as e:
+    print(f'AVISO: falha ao resetar USB ({e})', file=sys.stderr)
+"
+    sleep 2
+}
+
+status() {
+    if pgrep -f "$APP" >/dev/null 2>&1; then
+        echo "rodando (pid $(pgrep -f "$APP" | tr '\n' ' '))"
+    else
+        echo "parado"
+    fi
+}
+
+parar() {
+    pkill -9 -f "$APP" 2>/dev/null
+    # o -9 no processo principal nao mata o processo filho da deteccao de
+    # rosto (multiprocessing.spawn) nem o semaphore_tracker — ficam orfaos.
+    pkill -9 -f "$APPDIR/venv/bin/python.*multiprocessing" 2>/dev/null
+    sleep 1
+    resetar_usb
+}
+
+iniciar() {
+    if [ ! -x "$PY" ] || [ ! -f "$APP" ]; then
+        echo "ERRO: nao encontrei $PY ou $APP" >&2
+        exit 1
+    fi
+    if pgrep -f "$APP" >/dev/null 2>&1; then
+        echo "ja esta rodando (pid $(pgrep -f "$APP" | tr '\n' ' '))."
+        return 0
+    fi
+    cd "$APPDIR" || exit 1
+    nohup "$PY" -u "$APP" "$@" >"$LOG" 2>&1 &
+    disown
+    sleep 4
+    if pgrep -f "$APP" >/dev/null 2>&1; then
+        echo "Tela aberta na Jetson (DISPLAY $DISP). Log: $LOG"
+    else
+        echo "Falha ao abrir. Ultimas linhas de $LOG:" >&2
+        tail -n 20 "$LOG" >&2
+        exit 1
+    fi
+}
+
+case "${1:-}" in
+    stop)
+        parar; echo "Parado."
+        ;;
+    status)
+        status
+        ;;
+    start)
+        shift
+        iniciar "$@"
+        ;;
+    *)
+        # sem argumento (ou algo que nao seja start/stop/status): reinicia
+        parar
+        iniciar "$@"
+        ;;
+esac

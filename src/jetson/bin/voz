@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# voz - menu de texto no terminal (echo/read, sem interface grafica/ncurses)
+# pra escolher a voz e a velocidade da fala, e falar frases na caixa da
+# Jetson (HDMI/PulseAudio).
+#
+# Vozes:
+#   humana    -> Piper neural (pt_BR-faber), voz humana normal
+#   humana2   -> Piper neural (pt_BR-edresson), 2a voz humana
+#   robotica  -> espeak-ng via speech-dispatcher (motor do ./say_v1)
+#   ultron    -> Piper + pitch grave/formante deslocado + eco (Vingadores)
+#
+# Uso:
+#   ./voz                                   abre o menu (voz -> velocidade -> frases)
+#   ./voz -v ultron -s lenta "Vim trazer a paz."   fala direto, sem menu, e sai
+#   ./voz -v ultron                         fixa a voz/velocidade, abre so o loop de frases
+#   ./voz --list                            lista as chaves de voz/velocidade
+#
+set -u
+
+PIPER_DIR="$HOME/piper"
+VOICES_DIR="$PIPER_DIR/voices"
+ESPEAK_DATA="$PIPER_DIR/espeak-ng-data"
+SINK="${SAY_SINK:-alsa_output.platform-3510000.hda.hdmi-stereo-extra1}"
+export PULSE_SINK="$SINK"
+# bug de empacotamento do sistema: libespeak-ng procura os dados em
+# /usr/share/espeak-ng-data, mas o pacote instala em .../aarch64-linux-gnu/
+# (sem symlink). Sem isso o modulo espeak-ng do speech-dispatcher falha e a
+# voz robotica trava/engasga intermitentemente.
+export ESPEAK_DATA_PATH="${ESPEAK_DATA_PATH:-/usr/lib/aarch64-linux-gnu/espeak-ng-data}"
+export LD_LIBRARY_PATH="$PIPER_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+LOG=/tmp/voz.log
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+# mantem o amp HDMI acordado (evita cortar a 1a silaba entre falas)
+[ -x "$HOME/dev/say-keepalive" ] && "$HOME/dev/say-keepalive" start >/dev/null 2>&1
+
+# lead-in: ruido bem baixo (inaudivel) colado ANTES de cada fala, pra o
+# monitor HDMI acordar o amp antes da 1a silaba (mesma correcao do ~/dev/say;
+# sem isso a voz corta as primeiras letras). Sobrescreva com SAY_LEAD_MS=0
+# pra desligar, ou SAY_LEAD_AMP maior se ainda cortar.
+LEAD_MS="${SAY_LEAD_MS:-50}"
+LEAD_AMP="${SAY_LEAD_AMP:-30}"
+
+VOICE_KEYS=(humana humana2 robotica ultron)
+VOICE_LABELS=(
+    "Humana (Faber)"
+    "Humana (Edresson)"
+    "Robotica (espeak-ng)"
+    "Ultron (Vingadores)"
+)
+
+SPEED_KEYS=(muitolenta lenta normal rapida muitorapida)
+SPEED_LABELS=("Muito lenta" "Lenta" "Normal" "Rapida" "Muito rapida")
+
+# length_scale do Piper por velocidade (vozes baseadas em Piper: todas menos robotica)
+declare -A LENGTH_SCALE=(
+    [muitolenta]=1.5 [lenta]=1.2 [normal]=1.0 [rapida]=0.85 [muitorapida]=0.7
+)
+# rate do spd-say por velocidade (-100..100; so a voz robotica usa)
+declare -A SPD_RATE=(
+    [muitolenta]=-70 [lenta]=-40 [normal]=-10 [rapida]=20 [muitorapida]=50
+)
+
+usage() {
+    awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"
+    echo "vozes: ${VOICE_KEYS[*]}"
+    echo "velocidades: ${SPEED_KEYS[*]}"
+    exit "${1:-0}"
+}
+
+label_for() {
+    local -n keys="$1" labels="$2"; local want="$3" i
+    for i in "${!keys[@]}"; do
+        [ "${keys[$i]}" = "$want" ] && { echo "${labels[$i]}"; return 0; }
+    done
+    echo "$want"
+}
+
+valid_key() {
+    local -n keys="$1"; local want="$2" k
+    for k in "${keys[@]}"; do [ "$k" = "$want" ] && return 0; done
+    return 1
+}
+
+model_for() {
+    case "$1" in
+        humana)   ls "$VOICES_DIR"/pt_BR-faber-*.onnx 2>/dev/null | head -n1 ;;
+        humana2)  ls "$VOICES_DIR"/pt_BR-edresson-*.onnx 2>/dev/null | head -n1 ;;
+        ultron)   ls "$VOICES_DIR"/pt_BR-faber-*.onnx 2>/dev/null | head -n1 ;;
+    esac
+}
+
+gen_piper_wav() {
+    local text="$1" model="$2" length="$3" out="$4"
+    printf '%s\n' "$text" | "$PIPER_DIR/piper" -m "$model" --espeak_data "$ESPEAK_DATA" \
+        --length_scale "$length" -f "$out" >>"$LOG" 2>&1
+}
+
+# toca um wav colando LEAD_MS de ruido baixo (LEAD_AMP) na frente, no mesmo
+# stream de paplay (nao modifica o arquivo original).
+play_with_lead() {
+    local w="$1" tmp="${1%.wav}.lead.wav"
+    if [ "$LEAD_MS" -gt 0 ] 2>/dev/null; then
+        python3 - "$w" "$tmp" "$LEAD_MS" "$LEAD_AMP" <<'PY' 2>>"$LOG" || tmp=""
+import wave, sys, struct, random
+src, dst, lead_ms, amp = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+w = wave.open(src, 'rb')
+fr, ch, sw = w.getframerate(), w.getnchannels(), w.getsampwidth()
+data = w.readframes(w.getnframes()); w.close()
+n = int(fr * lead_ms / 1000) * ch
+lead = (struct.pack('<%dh' % n, *[random.randint(-amp, amp) for _ in range(n)])
+        if amp > 0 else b'\x00' * (n * 2))
+o = wave.open(dst, 'wb'); o.setnchannels(ch); o.setsampwidth(sw); o.setframerate(fr)
+o.writeframes(lead + data); o.close()
+PY
+    else
+        tmp=""
+    fi
+    if [ -n "$tmp" ] && [ -s "$tmp" ]; then
+        paplay --device="$SINK" "$tmp"; rm -f "$tmp"
+    else
+        paplay --device="$SINK" "$w"
+    fi
+}
+
+# gera (uma vez, cacheado em $work) um wav so com o lead-in, pra "acordar" o
+# amp antes de chamar o spd-say (voz robotica nao passa por paplay nosso).
+lead_only_wav() {
+    local out="$work/lead-only.wav"
+    if [ ! -s "$out" ]; then
+        python3 - "$out" "$LEAD_MS" "$LEAD_AMP" <<'PY' 2>>"$LOG"
+import wave, sys, struct, random
+dst, lead_ms, amp = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+fr, ch, sw = 22050, 1, 2
+n = int(fr * lead_ms / 1000) * ch
+data = (struct.pack('<%dh' % n, *[random.randint(-amp, amp) for _ in range(n)])
+        if amp > 0 else b'\x00' * (n * 2))
+o = wave.open(dst, 'wb'); o.setnchannels(ch); o.setsampwidth(sw); o.setframerate(fr)
+o.writeframes(data); o.close()
+PY
+    fi
+    [ -s "$out" ] && echo "$out"
+}
+
+apply_fx() {
+    local voice="$1" in="$2" out="$3"
+    case "$voice" in
+        ultron)
+            ffmpeg -nostdin -y -loglevel error -i "$in" -af \
+              "rubberband=pitch=0.72:formant=shifted,aecho=0.8:0.7:35:0.28,lowpass=f=3800,volume=1.3" \
+              "$out" >>"$LOG" 2>&1 ;;
+        *) cp "$in" "$out" ;;
+    esac
+}
+
+speak() {
+    local voice="$1" speed="$2" text="$3" model length raw fx
+    [ -z "${text//[[:space:]]/}" ] && return 0
+
+    if [ "$voice" = "robotica" ]; then
+        case "$text" in -*) text=" $text" ;; esac
+        # acorda o amp do HDMI antes da fala de verdade (spd-say nao passa
+        # pelo nosso paplay, entao o lead-in vai num arquivinho a parte,
+        # tocado logo antes, em vez de colado no mesmo stream).
+        local lead; lead=$(lead_only_wav)
+        [ -n "$lead" ] && paplay --device="$SINK" "$lead" 2>>"$LOG"
+        # timeout: o daemon speech-dispatcher as vezes trava/reautospawn com
+        # -w pendurado indefinidamente; sem isso a fala robotica podia
+        # congelar o menu inteiro.
+        timeout 20 spd-say -w -l pt-BR -r "${SPD_RATE[$speed]}" "$text"
+        local rc=$?
+        [ "$rc" -eq 124 ] && echo "AVISO: speech-dispatcher travou, mensagem descartada" >&2
+        return "$rc"
+    fi
+
+    model=$(model_for "$voice")
+    if [ -z "$model" ] || [ ! -f "$model" ]; then
+        echo "ERRO: modelo Piper nao encontrado para voz '$voice'" >&2
+        return 1
+    fi
+    length="${LENGTH_SCALE[$speed]}"
+    raw="$work/raw.wav"; fx="$work/fx.wav"
+    gen_piper_wav "$text" "$model" "$length" "$raw" || { echo "ERRO: piper falhou (veja $LOG)" >&2; return 1; }
+    apply_fx "$voice" "$raw" "$fx" || { echo "ERRO: ffmpeg falhou (veja $LOG)" >&2; return 1; }
+    play_with_lead "$fx"
+}
+
+# ---------- parse de argumentos (modo direto, sem menu) ----------
+VOICE=""; SPEED="normal"; DO_LIST=0
+phrase=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)   usage 0 ;;
+        --list)      DO_LIST=1 ;;
+        -v|--voice)  VOICE="${2:?falta valor para --voice}"; shift ;;
+        --voice=*)   VOICE="${1#*=}" ;;
+        -s|--speed)  SPEED="${2:?falta valor para --speed}"; shift ;;
+        --speed=*)   SPEED="${1#*=}" ;;
+        --)          shift; while [ $# -gt 0 ]; do phrase+=("$1"); shift; done; break ;;
+        -*)          echo "opcao desconhecida: $1" >&2; usage 1 ;;
+        *)           phrase+=("$1") ;;
+    esac
+    shift
+done
+
+if [ "$DO_LIST" = 1 ]; then
+    echo "vozes: ${VOICE_KEYS[*]}"
+    echo "velocidades: ${SPEED_KEYS[*]}"
+    exit 0
+fi
+
+if [ -n "$VOICE" ] && ! valid_key VOICE_KEYS "$VOICE"; then
+    echo "ERRO: voz '$VOICE' invalida. Use: ${VOICE_KEYS[*]}" >&2
+    exit 1
+fi
+if ! valid_key SPEED_KEYS "$SPEED"; then
+    echo "ERRO: velocidade '$SPEED' invalida. Use: ${SPEED_KEYS[*]}" >&2
+    exit 1
+fi
+
+if [ -n "$VOICE" ] && [ "${#phrase[@]}" -gt 0 ]; then
+    speak "$VOICE" "$SPEED" "${phrase[*]}"
+    exit $?
+fi
+
+if [ -n "$VOICE" ]; then
+    echo "Voz: $(label_for VOICE_KEYS VOICE_LABELS "$VOICE") | Velocidade: $(label_for SPEED_KEYS SPEED_LABELS "$SPEED")"
+    echo "Frase + Enter. Ctrl+D ou 'sair' encerra."
+    while IFS= read -r -p "> " line; do
+        case "$line" in sair|quit|exit) break ;; esac
+        speak "$VOICE" "$SPEED" "$line"
+    done
+    exit 0
+fi
+
+# ---------- modo menu (texto puro, so echo/read) ----------
+choose_from() {
+    # $1=titulo  $2=nome-do-array-de-chaves  $3=nome-do-array-de-labels
+    local titulo="$1" keys_name="$2" labels_name="$3"
+    local -n keys="$keys_name" labels="$labels_name"
+    local i n resp
+    # tudo que e so exibicao vai pro stderr: esta funcao e chamada como
+    # VOICE=$(choose_from ...), entao qualquer coisa no stdout viraria
+    # parte do valor escolhido em vez de aparecer na tela.
+    {
+        echo
+        echo "== $titulo =="
+        for i in "${!keys[@]}"; do
+            n=$((i + 1))
+            printf '  %d) %s\n' "$n" "${labels[$i]}"
+        done
+    } >&2
+    while true; do
+        if ! read -r -p "Escolha [1-${#keys[@]}]: " resp; then
+            echo >&2
+            echo "Ate mais!" >&2
+            exit 0
+        fi
+        [ -z "$resp" ] && continue
+        if [[ "$resp" =~ ^[0-9]+$ ]] && [ "$resp" -ge 1 ] && [ "$resp" -le "${#keys[@]}" ]; then
+            echo "${keys[$((resp - 1))]}"
+            return 0
+        fi
+        echo "opcao invalida, tente de novo." >&2
+    done
+}
+
+while true; do
+    VOICE=$(choose_from "Escolha a voz" VOICE_KEYS VOICE_LABELS)
+    SPEED=$(choose_from "Escolha a velocidade" SPEED_KEYS SPEED_LABELS)
+    echo
+    echo "Voz: $(label_for VOICE_KEYS VOICE_LABELS "$VOICE") | Velocidade: $(label_for SPEED_KEYS SPEED_LABELS "$SPEED")"
+    echo "Frase + Enter. Ctrl+D ou 'sair' troca de voz/velocidade."
+    eof=0
+    while true; do
+        if ! IFS= read -r -p "> " line; then eof=1; break; fi
+        case "$line" in sair|quit|exit) break ;; esac
+        speak "$VOICE" "$SPEED" "$line"
+    done
+    echo
+    [ "$eof" = 1 ] && break
+    if ! read -r -p "Trocar de voz/velocidade? [S/n]: " resp; then break; fi
+    case "$resp" in
+        n|N|nao|Nao|NAO) break ;;
+    esac
+done
+echo "Ate mais!"

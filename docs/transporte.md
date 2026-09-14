@@ -23,6 +23,9 @@ tipo 0x02 = AUDIO  → payload = bytes de um arquivo WAV
   quantos `recv()` forem necessários.
 - **Por que o byte de tipo:** até a etapa (b) só trafegava texto. A etapa
   (d) manda WAV pelo mesmo socket, e o receptor precisa saber o que chegou.
+  Na etapa (d2) o `AUDIO` trafega **nos dois sentidos**: a Jetson manda a
+  fala captada, o PC devolve a resposta já sintetizada em voz (WAV). Se o
+  PC estiver sem TTS, a resposta volta como `TEXTO` (fallback).
 - **Teto:** `MAX_MSG = 64 MiB` por mensagem (sanidade; cobre um WAV curto).
 
 Implementação: [`../src/common/protocol.py`](../src/common/protocol.py).

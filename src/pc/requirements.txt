@@ -1,9 +1,14 @@
 # server.py e server_chat.py não têm dependência nenhuma (só biblioteca
 # padrão) — é o que roda hoje, sem microfone na Jetson.
 
-# Transcrição (pc/stt.py, pc/server_voz.py) — só quando a Jetson tiver mic
+# Transcrição (pc/stt.py, pc/server_voz.py)
 faster-whisper>=1.0
 
-# Ferramenta local de captura+transcrição (pc/push_to_talk.py)
+# Ferramenta local de captura+transcrição (pc/push_to_talk.py) e, via
+# common/audio_io.py, a captura/reprodução do cliente de voz.
 sounddevice>=0.4.6
 numpy>=1.24
+
+# Síntese de voz (pc/tts.py, usado por pc/server_voz.py): NÃO é pacote pip.
+# Instale pelo sistema:
+#   sudo apt install -y espeak-ng

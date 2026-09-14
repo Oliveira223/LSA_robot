@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# mic-test - teste simples do microfone (PrimeSense) via SSH.
+#
+#   ESPACO  - comeca a gravar / aperta de novo para parar
+#             (enquanto grava, mostra os segundos no terminal)
+#   ENTER   - toca a ultima gravacao (na caixa do HDMI)
+#   + / -   - aumenta / diminui a sensibilidade (ganho) do mic
+#   q       - sai
+#
+# Grava direto do ALSA hw (S16_LE 48k 2ch) suspendendo a source do PulseAudio
+# antes (senao da "device busy" / silencio). Reabilita ao terminar.
+#
+set -u
+
+WAV="/tmp/mic-test.wav"
+RATE=48000
+SINK="${SAY_SINK:-alsa_output.platform-3510000.hda.hdmi-stereo-extra1}"
+# ganho de captura do PrimeSense: 0-4182 (0-49dB). Default da placa (3576)
+# satura em voz normal; MIC_GAIN deixa configurar via env se precisar.
+GAINMAX=4182
+GAINSTEP=200
+GAIN="${MIC_GAIN:-1700}"
+
+CARD=$(arecord -l 2>/dev/null | sed -n 's/^card \([0-9]\+\):.*PrimeSense.*/\1/p' | head -n1)
+[ -n "$CARD" ] || CARD=2
+DEV="hw:${CARD},0"
+SRC=$(pactl list short sources 2>/dev/null | awk '/PrimeSense/ && /input/ {print $2; exit}')
+[ -n "$SRC" ] || SRC="alsa_input.usb-PrimeSense_PrimeSense_Device-01.analog-stereo"
+
+command -v arecord >/dev/null || { echo "arecord nao encontrado (instale alsa-utils)"; exit 1; }
+
+apply_gain() {
+    [ "$GAIN" -lt 0 ] && GAIN=0
+    [ "$GAIN" -gt "$GAINMAX" ] && GAIN=$GAINMAX
+    amixer -c "$CARD" cset numid=4 "$GAIN" >/dev/null 2>&1
+    amixer -c "$CARD" cset numid=5 "$GAIN" >/dev/null 2>&1
+}
+show_gain() {
+    printf '  ganho: %d%%\n' "$(( GAIN * 100 / GAINMAX ))"
+}
+apply_gain
+
+APID=""; TPID=""
+cleanup() {
+    [ -n "$APID" ] && kill -INT "$APID" 2>/dev/null
+    [ -n "$TPID" ] && kill "$TPID" 2>/dev/null
+    pactl suspend-source "$SRC" 0 >/dev/null 2>&1
+    stty echo 2>/dev/null
+    printf '\n'
+}
+trap cleanup EXIT INT TERM
+
+stop_arecord() {
+    [ -n "$APID" ] || return 0
+    kill -INT "$APID" 2>/dev/null
+    local i
+    for i in $(seq 1 20); do kill -0 "$APID" 2>/dev/null || break; sleep 0.1; done
+    kill -KILL "$APID" 2>/dev/null
+    wait "$APID" 2>/dev/null
+    APID=""
+}
+
+record() {
+    pactl suspend-source "$SRC" 1 >/dev/null 2>&1
+    rm -f "$WAV"
+    # </dev/null: senao o arecord captura o ESPACO pro proprio pause dele
+    arecord -q -D "$DEV" -f S16_LE -r "$RATE" -c 2 -t wav "$WAV" </dev/null &
+    APID=$!
+    sleep 0.3
+    if ! kill -0 "$APID" 2>/dev/null; then
+        printf '  \033[31mfalha ao abrir o microfone em %s\033[0m\n' "$DEV"
+        wait "$APID" 2>/dev/null; APID=""
+        pactl suspend-source "$SRC" 0 >/dev/null 2>&1
+        return
+    fi
+    local t0; t0=$(date +%s)
+    ( while kill -0 "$APID" 2>/dev/null; do
+        printf '\r\033[K  \033[31m\xe2\x97\x8f\033[0m gravando: %d s   (ESPACO para parar)' "$(( $(date +%s) - t0 ))"
+        sleep 0.25
+      done ) </dev/null &
+    TPID=$!
+    local k=""
+    while [ "$k" != " " ]; do IFS= read -rsn1 k || k=" "; done
+    stop_arecord
+    kill "$TPID" 2>/dev/null; wait "$TPID" 2>/dev/null; TPID=""
+    pactl suspend-source "$SRC" 0 >/dev/null 2>&1
+    printf '\r\033[K  \033[32m\xe2\x9c\x94\033[0m gravado: %d s\n' "$(( $(date +%s) - t0 ))"
+    python3 - "$WAV" <<'PY' 2>/dev/null
+import wave, audioop, sys
+try:
+    w = wave.open(sys.argv[1], 'rb'); d = w.readframes(w.getnframes())
+    print("  nivel: pico=%d  rms=%d   (silencio ~ rms<50)" % (audioop.max(d, 2), audioop.rms(d, 2)))
+except Exception:
+    pass
+PY
+}
+
+play() {
+    if [ ! -s "$WAV" ]; then
+        echo "  (nada gravado ainda - aperte ESPACO primeiro)"; return
+    fi
+    local sz dur
+    sz=$(stat -c%s "$WAV" 2>/dev/null || echo 44)
+    dur=$(( (sz - 44) / (RATE * 2 * 2) ))
+    printf '  \033[36m\xe2\x99\xaa\033[0m tocando (%d s)...\n' "$dur"
+    paplay --device="$SINK" "$WAV"
+}
+
+echo "Teste de microfone - PrimeSense ($DEV)"
+echo "saida: $SINK"
+show_gain
+while true; do
+    printf '\n[ESPACO] gravar/parar   [ENTER] ouvir a ultima   [+/-] ganho   [q] sair\n> '
+    IFS= read -rsn1 key || break
+    case "$key" in
+        ' ')   printf '\n'; record ;;
+        '')    printf '\n'; play ;;
+        +)     printf '\n'; GAIN=$(( GAIN + GAINSTEP )); apply_gain; show_gain ;;
+        -)     printf '\n'; GAIN=$(( GAIN - GAINSTEP )); apply_gain; show_gain ;;
+        q|Q)   printf '\n'; break ;;
+        *)     : ;;
+    esac
+done

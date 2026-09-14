@@ -1,9 +1,5 @@
 """
-server_voz.py — servidor da etapa (d): áudio → texto → resposta.
-
-Ainda não usado em produção: a Jetson atual não tem microfone. Fica pronto
-para quando o hardware chegar — até lá, pc/server_chat.py cobre a troca de
-mensagens usando só texto.
+server_voz.py — servidor da etapa (d2): áudio → texto → resposta em voz.
 
 Fluxo por mensagem recebida da Jetson:
   1. recebe um WAV (mensagem do tipo AUDIO);
@@ -11,10 +7,14 @@ Fluxo por mensagem recebida da Jetson:
   3. mostra a transcrição no terminal;
   4. chama pc.cerebro.responder() — por ora um OPERADOR HUMANO digita a
      resposta, simulando a IA;
-  5. devolve a resposta como texto para a Jetson.
+  5. sintetiza a resposta com espeak-ng (pc.tts) e devolve como mensagem
+     AUDIO para a Jetson, que só toca no speaker. Se o TTS não estiver
+     disponível, cai para enviar a resposta como texto puro.
 
 O passo 4 é o ponto que, mais adiante, vira uma chamada de IA de verdade
 (regras + modelo) — trocar pc/cerebro.py não exige mexer neste arquivo.
+A síntese de voz roda aqui no PC de propósito: a Jetson não tem motor de
+TTS (ver docs/roadmap-comunicacao.md, Fase 4).
 
 Uso (a partir de src/):
     python -m pc.server_voz [host] [porta]
@@ -28,8 +28,8 @@ import socket
 import sys
 import tempfile
 
-from common.protocol import AUDIO, recv_msg, send_texto
-from pc import stt
+from common.protocol import AUDIO, recv_msg, send_audio, send_texto
+from pc import stt, tts
 from pc.cerebro import responder
 
 
@@ -72,7 +72,17 @@ def atender(conexao: socket.socket) -> None:
 
         if not texto:
             print("[servidor] nada foi transcrito — o audio pode estar sem fala")
-        send_texto(conexao, responder(texto))
+
+        resposta = responder(texto)
+        print(f"[servidor] resposta: {resposta!r}")
+        try:
+            wav = tts.sintetizar(resposta)
+        except tts.ErroDeTTS as e:
+            print(f"[servidor] TTS indisponivel ({e}); enviando resposta como texto")
+            send_texto(conexao, resposta)
+            continue
+        send_audio(conexao, wav)
+        print(f"[servidor] resposta enviada em voz: {len(wav)} bytes", flush=True)
 
 
 def main() -> None:
@@ -84,7 +94,10 @@ def main() -> None:
     servidor.bind((host, porta))
     servidor.listen(1)
     print(f"[servidor] escutando em {host}:{porta} (Ctrl-C para sair)")
-    print("[servidor] modo voz: transcreve o audio e espera voce digitar a resposta")
+    print("[servidor] modo voz: transcreve o audio, voce digita a resposta, ela volta em voz")
+    if not tts.disponivel():
+        print("[servidor] AVISO: espeak-ng nao encontrado — a resposta voltara como texto.")
+        print("[servidor]        instale com: sudo apt install -y espeak-ng")
 
     try:
         while True:

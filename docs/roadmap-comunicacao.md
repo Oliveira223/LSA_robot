@@ -65,14 +65,25 @@ ping <IP_DO_RASP>
 ## Fase 4 — Pipeline completo (STT → texto → TTS)
 
 **O que fazer:**
-- PC recebe áudio, roda `faster-whisper`, devolve o texto transcrito pelo mesmo socket (ou nova conexão).
-- Jetson recebe o texto e sintetiza voz localmente.
+- PC recebe áudio, roda `faster-whisper`, gera a resposta (por ora um operador digita).
+- **O PC também sintetiza a voz** (`pc/tts.py`) e devolve a resposta como
+  mensagem `AUDIO` (WAV) pelo mesmo socket. A Jetson só recebe o WAV pronto
+  e toca no speaker — sem motor de TTS a bordo.
 
-**Opções de TTS na Jetson (do mais leve ao mais pesado):**
-- `espeak-ng` — robótico, muito leve, roda sem esforço no Pi. Combina até com estética de robô.
-- `piper` — TTS neural, leve o suficiente pro Pi, com vozes bem mais naturais que espeak.
+**Onde o TTS roda — decisão (2026-09-08): no PC, não na Jetson.**
+O roadmap original previa sintetizar voz na Jetson. Mudou para manter a
+Jetson como só "ouvido e boca": a voz do robô fica ao lado do "cérebro"
+(`pc/cerebro.py`), fácil de trocar sem tocar no hardware da cabeça, e o
+protocolo já carrega `AUDIO` nos dois sentidos. Enviar um WAV curto pela
+rede local é simétrico ao áudio que a Jetson já manda.
 
-**Critério de sucesso:** fala captada pelo mic → texto correto no PC → voz sintetizada e tocada no speaker do robô, em um ciclo completo.
+**Motor de TTS (do mais leve ao mais pesado), agora rodando no PC:**
+- `espeak-ng` — robótico, muito leve, pacote de sistema (apt), sem modelo
+  para baixar (evita o problema de download longo na rede da PUC). **Em uso.**
+- `piper` — TTS neural, vozes bem mais naturais; tem modelo para baixar.
+  Trocar é mexer só em `pc/tts.py`, mantendo `sintetizar(texto) -> bytes`.
+
+**Critério de sucesso:** fala captada pelo mic → texto correto no PC → voz sintetizada e tocada no speaker, em um ciclo completo.
 
 ---
 

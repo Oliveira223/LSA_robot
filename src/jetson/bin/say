@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# say - fala em voz alta (TTS neural Piper, vozes pt-BR) o texto que voce
+# passar como argumento e/ou digitar. Saida na caixa da Jetson (HDMI/PulseAudio).
+# Feito para rodar via SSH. Tambem em ~/.local/bin/say -> chame de qualquer lugar.
+#
+#   say Ola, tudo bem?              fala a frase e DEPOIS abre o modo interativo
+#   say                            so o modo interativo (frase + Enter)
+#   say -1 "texto"                 fala e sai (para scripts)
+#   say -s / -f                    devagar / rapido
+#   say -l 1.4 "..."               length_scale explicito (padrao 1.0; >1 devagar)
+#   say -v edresson "..."          troca a voz (faber = padrao)
+#   say -o /tmp/x.wav "..."        grava o wav (modo pontual, sem interativo)
+#
+# Interativo: um processo Piper fica residente (nao recarrega o modelo a cada
+# frase); cada linha vira um .wav completo, tocado com um paplay novo (evita o
+# corte da 1a silaba que o fluxo pacat residente causava). "sair"/"quit"/"exit"
+# ou Ctrl+D encerram. Motor antigo: ~/Desktop/say_v1  ou  spd-say -l pt-BR "..."
+#
+set -u
+
+PIPER_DIR="$HOME/piper"
+VOICES_DIR="$PIPER_DIR/voices"
+ESPEAK_DATA="$PIPER_DIR/espeak-ng-data"
+LOG="/tmp/piper.log"
+RATE_HZ=22050
+# sink de saida: fixo no HDMI (onde esta a caixa). Sobrescreva com SAY_SINK=...
+SINK="${SAY_SINK:-alsa_output.platform-3510000.hda.hdmi-stereo-extra1}"
+# lead-in: ruido bem baixo (inaudivel) colado ANTES de cada fala, no mesmo
+# stream, pra o monitor HDMI acordar o amp antes da 1a silaba.
+LEAD_MS="${SAY_LEAD_MS:-50}"       # duracao do lead-in (50ms = suficiente aqui)
+LEAD_AMP="${SAY_LEAD_AMP:-30}"     # amplitude (0..32767); ~30 = -60 dBFS. Suba se cortar; baixe se ouvir chiado
+export LD_LIBRARY_PATH="$PIPER_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+voice="faber"
+length="${LENGTH_SCALE:-1.0}"
+save=""
+once=0
+phrase=()
+
+list_voices() {
+    (cd "$VOICES_DIR" 2>/dev/null && ls pt_BR-*.onnx 2>/dev/null \
+        | sed 's/^pt_BR-//; s/\.onnx$//') | tr '\n' ' '
+}
+
+usage() {
+    awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"
+    echo "vozes disponiveis: $(list_voices)"
+    exit "${1:-0}"
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)   usage 0 ;;
+        -1|--once)   once=1 ;;
+        -s|--slow)   length=1.3 ;;
+        -f|--fast)   length=0.85 ;;
+        -l|--length) length="${2:?falta valor para --length}"; shift ;;
+        --length=*)  length="${1#*=}" ;;
+        -v|--voice)  voice="${2:?falta valor para --voice}"; shift ;;
+        --voice=*)   voice="${1#*=}" ;;
+        -o|--save)   save="${2:?falta valor para --save}"; shift ;;
+        --save=*)    save="${1#*=}" ;;
+        --)          shift; while [ $# -gt 0 ]; do phrase+=("$1"); shift; done; break ;;
+        -*)          echo "opcao desconhecida: $1" >&2; usage 1 ;;
+        *)           phrase+=("$1") ;;
+    esac
+    shift
+done
+
+model=$(ls "$VOICES_DIR"/pt_BR-"$voice"-*.onnx 2>/dev/null | head -n1)
+if [ -z "$model" ] || [ ! -f "$model" ]; then
+    echo "ERRO: voz '$voice' nao encontrada em $VOICES_DIR" >&2
+    echo "vozes disponiveis: $(list_voices)" >&2
+    exit 1
+fi
+if [ ! -x "$PIPER_DIR/piper" ]; then
+    echo "ERRO: piper nao encontrado em $PIPER_DIR" >&2
+    exit 1
+fi
+
+# keepalive: mantem o audio HDMI "acordado" pra o monitor nao cortar a 1a
+# silaba entre as falas. Sobe uma vez e fica (desligue com: say-keepalive stop).
+if [ "${SAY_NO_KEEPALIVE:-0}" != 1 ] && [ -x "$HOME/dev/say-keepalive" ]; then
+    "$HOME/dev/say-keepalive" start >/dev/null 2>&1 || true
+fi
+
+# toca um wav colando LEAD_MS de ruido baixo (LEAD_AMP) na frente, no mesmo
+# stream. Nao modifica o arquivo original.
+play_with_lead() {
+    local w="$1" tmp="${1%.wav}.lead.wav"
+    if [ "$LEAD_MS" -gt 0 ] 2>/dev/null; then
+        python3 - "$w" "$tmp" "$LEAD_MS" "$LEAD_AMP" <<'PY' 2>>"$LOG" || tmp=""
+import wave, sys, struct, random
+src, dst, lead_ms, amp = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+w = wave.open(src, 'rb')
+fr, ch, sw = w.getframerate(), w.getnchannels(), w.getsampwidth()
+data = w.readframes(w.getnframes()); w.close()
+n = int(fr * lead_ms / 1000) * ch
+lead = (struct.pack('<%dh' % n, *[random.randint(-amp, amp) for _ in range(n)])
+        if amp > 0 else b'\x00' * (n * 2))
+o = wave.open(dst, 'wb'); o.setnchannels(ch); o.setsampwidth(sw); o.setframerate(fr)
+o.writeframes(lead + data); o.close()
+PY
+    else
+        tmp=""
+    fi
+    if [ -n "$tmp" ] && [ -s "$tmp" ]; then
+        paplay --device="$SINK" "$tmp"; rm -f "$tmp"
+    else
+        paplay --device="$SINK" "$w"
+    fi
+}
+
+# ---------- modo pontual: gravar wav (caminho classico, sem streaming) ----------
+if [ -n "$save" ]; then
+    if [ "${#phrase[@]}" -eq 0 ]; then
+        echo "ERRO: -o precisa de uma frase. Ex: say -o /tmp/x.wav \"ola\"" >&2
+        exit 1
+    fi
+    printf '%s\n' "${phrase[*]}" | "$PIPER_DIR/piper" -m "$model" \
+        --espeak_data "$ESPEAK_DATA" --length_scale "$length" -f "$save" 2>>"$LOG"
+    play_with_lead "$save"          # nao altera $save; toca uma copia com lead-in
+    exit $?
+fi
+
+# ---------- motor residente: piper --json-input -> 1 wav por linha -> paplay ----------
+engine_pid=""
+work=""
+seq_n=0
+
+start_engine() {
+    work="$(mktemp -d)"
+    mkfifo "$work/in"
+    ( "$PIPER_DIR/piper" -m "$model" --espeak_data "$ESPEAK_DATA" \
+        --length_scale "$length" --json-input <"$work/in" >/dev/null 2>>"$LOG" ) &
+    engine_pid=$!
+    exec 4>"$work/in"          # mantem o stdin do piper aberto
+}
+
+cleanup() {
+    [ -n "$engine_pid" ] || return 0
+    exec 4>&- 2>/dev/null      # EOF -> piper sai
+    wait "$engine_pid" 2>/dev/null
+    [ -n "$work" ] && rm -rf "$work" 2>/dev/null
+    engine_pid=""
+}
+trap cleanup EXIT
+trap 'kill "$engine_pid" 2>/dev/null; exit 130' INT TERM
+
+say_line() {
+    local t="$1" esc out i s1 s2
+    [ -z "${t//[[:space:]]/}" ] && return 0
+    seq_n=$((seq_n + 1))
+    out="$work/$seq_n.wav"
+    esc=${t//\\/\\\\}; esc=${esc//\"/\\\"}        # escapa \ e " para JSON
+    printf '{"text": "%s", "output_file": "%s"}\n' "$esc" "$out" >&4
+    # espera o wav ficar pronto (existe e parou de crescer)
+    for i in $(seq 1 800); do
+        if [ -s "$out" ]; then
+            s1=$(stat -c%s "$out" 2>/dev/null); sleep 0.05
+            s2=$(stat -c%s "$out" 2>/dev/null)
+            [ "$s1" = "$s2" ] && break
+        else
+            sleep 0.03
+        fi
+        kill -0 "$engine_pid" 2>/dev/null || { echo "(piper encerrou; veja $LOG)" >&2; return 1; }
+    done
+    [ -s "$out" ] || { echo "(timeout esperando o audio)" >&2; return 1; }
+    play_with_lead "$out"
+    rm -f "$out"
+}
+
+start_engine
+
+[ "${#phrase[@]}" -gt 0 ] && say_line "${phrase[*]}"
+
+if [ "$once" -eq 1 ]; then
+    cleanup                # espera terminar de falar antes de sair
+    exit 0
+fi
+
+echo "Voz: $(basename "$model" .onnx | sed 's/^pt_BR-//')  |  length_scale=$length  |  'sair' ou Ctrl+D encerra"
+while IFS= read -r -p "> " line; do
+    case "$line" in sair|quit|exit) break ;; esac
+    say_line "$line"
+done
+echo
+cleanup

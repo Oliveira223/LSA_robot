@@ -1,0 +1,23 @@
+# ─────────────────────────────────────────────────────────────
+# Jetson (aarch64 / JetPack, Python 3.6) — versões compatíveis.
+# OpenCV e NumPy vêm do sistema (pacotes apt do JetPack), por isso
+# NÃO são instalados aqui. Crie o venv com acesso aos pacotes do
+# sistema:  python3 -m venv --system-site-packages venv
+#
+# Em desktop x86_64 com Python 3.8+, use requirements-desktop.txt.
+# ─────────────────────────────────────────────────────────────
+
+# GUI — customtkinter 4.x já exige Python 3.7+ (usa `from __future__
+# import annotations`). 3.11 é o último que roda em Python 3.6.
+# O código usa um shim de compatibilidade no topo de
+# Run_Camera_Prime_Sense.py para a API antiga (CTkFont, CTkOptionMenu...).
+customtkinter==3.11
+
+# Conversão de frame p/ Tk
+Pillow==8.4.0
+
+# Driver / wrapper do sensor (OpenNI2) — 2.3.0 não existe no PyPI
+primesense==2.2.0.30.post5
+
+# opencv-python  -> fornecido pelo sistema (python3-opencv do JetPack)
+# numpy          -> fornecido pelo sistema

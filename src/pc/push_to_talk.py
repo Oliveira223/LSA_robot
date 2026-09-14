@@ -25,91 +25,12 @@ Dependências (no PC):  pip install -r src/pc/requirements.txt
 from __future__ import annotations
 
 import sys
-import threading
-import time
 
 import numpy as np
 import sounddevice as sd
 
+from common.audio_io import Cronometro, Gravador
 from pc import stt
-
-TAXA_PREFERIDA = 16000
-CANAIS = 1
-
-
-class Gravador:
-    """Stream de entrada sempre aberto; acumula quadros só entre iniciar() e parar()."""
-
-    def __init__(self, indice_dispositivo=None):
-        self._quadros: list[np.ndarray] = []
-        self._ativo = False
-        self._lock = threading.Lock()
-
-        try:
-            sd.check_input_settings(device=indice_dispositivo, channels=CANAIS,
-                                    samplerate=TAXA_PREFERIDA, dtype="float32")
-            self.taxa = TAXA_PREFERIDA
-        except Exception:
-            info = sd.query_devices(indice_dispositivo, "input")
-            self.taxa = int(info["default_samplerate"])
-
-        self._stream = sd.InputStream(
-            samplerate=self.taxa, channels=CANAIS, dtype="float32",
-            device=indice_dispositivo, callback=self._callback,
-        )
-        self.nome = sd.query_devices(indice_dispositivo, "input")["name"]
-
-    def _callback(self, indata, _frames, _time, status):
-        if status:
-            print(f"[mic] {status}", file=sys.stderr, flush=True)
-        with self._lock:
-            if self._ativo:
-                self._quadros.append(indata.copy())
-
-    def __enter__(self):
-        self._stream.start()
-        return self
-
-    def __exit__(self, *_):
-        self._stream.stop()
-        self._stream.close()
-
-    def iniciar(self):
-        with self._lock:
-            self._quadros.clear()
-            self._ativo = True
-
-    def parar(self) -> np.ndarray:
-        with self._lock:
-            self._ativo = False
-            if not self._quadros:
-                return np.zeros(0, dtype=np.float32)
-            return np.concatenate(self._quadros).reshape(-1)
-
-
-class Cronometro:
-    """Escreve '<rótulo> N.Ns<sufixo>' na mesma linha até ser parado. `elapsed` no fim."""
-
-    def __init__(self, rotulo: str, sufixo: str = ""):
-        self._rotulo, self._sufixo = rotulo, sufixo
-        self._parar = threading.Event()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self.elapsed = 0.0
-
-    def _loop(self):
-        while not self._parar.wait(0.1):
-            e = time.monotonic() - self._t0
-            print(f"\r{self._rotulo} {e:4.1f}s{self._sufixo}   ", end="", flush=True)
-
-    def __enter__(self):
-        self._t0 = time.monotonic()
-        self._thread.start()
-        return self
-
-    def __exit__(self, *_):
-        self._parar.set()
-        self._thread.join(timeout=1)
-        self.elapsed = time.monotonic() - self._t0
 
 
 def _preparar(audio: np.ndarray) -> tuple[np.ndarray, float, float]:

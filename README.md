@@ -24,7 +24,7 @@ speaker). Transcrição, "cérebro" e qualquer processamento pesado rodam **no P
 | **(b)** | mesmo código, via túnel SSH entre PC e Jetson | ✅ feito |
 | **(c)** | mesmo código, via WiFi direto (IP real na LAN) | ⏸️ adiada (rede da PUC — ver [docs/transporte.md](docs/transporte.md)) |
 | **(d1)** | "chat" de texto Jetson ↔ PC, sem áudio (sem mic na Jetson ainda) | ✅ feito |
-| **(d2)** | integração de áudio (captura → transcrição → resposta → TTS) | ⏸️ aguardando microfone/speaker na Jetson |
+| **(d2)** | integração de áudio (captura → transcrição → resposta → TTS) | 🔜 em teste local no PC (localhost); Jetson ainda sem áudio |
 
 Em (d1) e (d2), enquanto não há IA, um **operador humano** no PC lê a
 mensagem (texto ou transcrição) e digita a resposta — fazendo as vezes do
@@ -39,16 +39,18 @@ docs/                roadmaps, to-do e a referência do transporte
 hardware/stl/         peças 3D do robô (InMoov, CC BY-NC) — sem código
 src/                  todo o código executável; rode a partir daqui, via python3 -m
   common/protocol.py    enquadramento de mensagens sobre TCP (usado pelos dois lados)
+  common/audio_io.py    captura (ENTER/ENTER) e reprodução de WAV; compartilhado pc ↔ jetson
   pc/                   roda no PC ("o cérebro")
     server.py            servidor de texto; responde .upper() (regressão das etapas a/b)
     server_chat.py        etapa d1: recebe texto → operador digita resposta (sem áudio)
-    server_voz.py         etapa d2: recebe áudio → transcreve → operador digita resposta
+    server_voz.py         etapa d2: recebe áudio → transcreve → operador responde → devolve voz
     cerebro.py            a resposta em si (hoje: operador humano); usado por server_chat e server_voz
     stt.py                transcrição local com faster-whisper
+    tts.py                síntese de voz local com espeak-ng (resposta → WAV)
   jetson/               roda na Jetson (simulado no PC no início)
     client.py            cliente de texto (lê do teclado) — etapas a/b/d1
-    audio_client.py      etapa d2: grava do microfone → envia → imprime a resposta
-    audio.py             captura de microfone (WAV 16 kHz mono)
+    audio_client.py      etapa d2: ENTER grava / ENTER para → envia → toca a resposta em voz
+    audio.py             captura de microfone por duração fixa (WAV 16 kHz mono)
     testar_microfone.py  diagnóstico de microfone
 experiments/         protótipos fora do caminho atual (ex.: STT via API OpenAI)
 PROGRESSO.md         log cronológico do que foi feito, decisões e próximos passos
@@ -86,40 +88,44 @@ Isso já deixa o máximo do trabalho no PC (`pc.cerebro.responder`), pronto
 para virar IA de verdade sem mexer no cliente da Jetson (ver
 [docs/roadmap-ia-conversacional.md](docs/roadmap-ia-conversacional.md)).
 
-### Etapa (d2) — áudio → texto → operador
+### Etapa (d2) — áudio → transcrição → operador → voz
 
-Precisa de microfone (e, mais adiante, speaker) na Jetson — ainda não
-disponível. Deixado pronto para quando o hardware chegar.
+Fala captada pelo microfone → WAV pelo socket → `faster-whisper` transcreve
+no PC → operador digita a resposta → `espeak-ng` sintetiza a resposta no PC
+→ WAV volta pelo socket → toca no speaker. A Jetson só grava e toca; a voz
+é gerada no PC (ver [docs/roadmap-comunicacao.md](docs/roadmap-comunicacao.md), Fase 4).
 
-Dependências (cada máquina só instala o que roda nela):
+Enquanto a Jetson não tem microfone/speaker, o teste roda **todo no PC**
+(localhost): o notebook grava pelo próprio mic e toca pelos próprios
+alto-falantes.
+
+Dependências:
 
 ```bash
-# PC — faster-whisper. Se o pip reclamar de "externally-managed", use venv:
+# PC — faster-whisper (pip) + espeak-ng (apt). Se o pip reclamar de
+# "externally-managed", use venv:
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r src/pc/requirements.txt
+sudo apt install -y espeak-ng          # TTS; sem isso a resposta volta como texto
 
-# Jetson — se o pip do Python do sistema estiver bloqueado (PEP 668) e
-# python3-sounddevice não estiver no apt: numpy vem do apt; sounddevice
-# (pequeno, puro Python) entra num venv que enxerga o sistema:
-sudo apt install -y python3-numpy libportaudio2
-python3 -m venv --system-site-packages ~/dev/LSA_robot/.venv
-~/dev/LSA_robot/.venv/bin/pip install sounddevice
-#   rodar com: ~/dev/LSA_robot/.venv/bin/python -m jetson.audio_client ...
-#   (libportaudio2 é obrigatório — é a lib C que o sounddevice usa em runtime)
+# Também precisa de sounddevice + numpy para a captura/reprodução (já estão
+# no requirements do PC). Na Jetson de verdade, mais adiante:
+#   sudo apt install -y libportaudio2   # lib C do sounddevice em runtime
 ```
 
-Enquanto a Jetson está simulada no próprio notebook, essa máquina faz os
-dois papéis e precisa dos dois conjuntos.
+Rodar (dois terminais no PC, a partir de `src/`):
 
 ```bash
 cd src
-python3 -m pc.server_voz                        # PC: transcreve e espera a resposta do operador
-python3 -m jetson.audio_client 127.0.0.1 5000   # Jetson: Enter para gravar 5 s, envia, mostra a resposta
+python3 -m pc.server_voz                        # transcreve, você digita a resposta, ela volta em voz
+python3 -m jetson.audio_client 127.0.0.1 5000   # ENTER grava / ENTER para / q sai
+#   3º argumento opcional: índice do microfone (veja 'python3 -m pc.push_to_talk --list')
 ```
 
 A primeira execução do `server_voz` baixa o modelo do faster-whisper
 (`small` por padrão; `export LSA_WHISPER_MODEL=base` — ou `tiny` — para um
-mais leve, útil em conexão ruim).
+mais leve, útil em conexão ruim). Voz e ritmo do TTS: `export LSA_TTS_VOZ=pt`,
+`export LSA_TTS_WPM=175`.
 
 ### Ferramenta local — captura + transcrição
 

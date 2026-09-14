@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# say-keepalive - mantem um fluxo de audio continuo (silencio, ou ruido bem
+# baixo) indo pro sink HDMI, pra o MONITOR (Acer E2260) nao "dormir" o audio
+# entre as falas e cortar a 1a silaba quando o som volta.
+#
+# O caminho de software (piper -> pacat -> PulseAudio -> ALSA/HDMI) ja foi
+# medido e esta bit-perfect; o corte acontece no receptor HDMI do monitor.
+#
+#   say-keepalive [start]   liga (idempotente)
+#   say-keepalive stop      desliga
+#   say-keepalive status    estado
+#
+# Env: SAY_SINK=<sink>   KEEPALIVE_AMP=<0..32767>  (0 = silencio puro; suba p/
+#      ~20-60 se o monitor ainda cortar)   KEEPALIVE_REGEN=1 (regera o buffer)
+#
+set -u
+
+SINK="${SAY_SINK:-alsa_output.platform-3510000.hda.hdmi-stereo-extra1}"
+RATE=22050
+AMP="${KEEPALIVE_AMP:-0}"
+RAW="$HOME/piper/keepalive.raw"
+PIDF="$HOME/.cache/say-keepalive.pid"
+mkdir -p "$(dirname "$PIDF")"
+
+alive() { [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null; }
+
+stop() {
+    if [ -f "$PIDF" ]; then
+        local p; p="$(cat "$PIDF" 2>/dev/null)"
+        [ -n "$p" ] && kill "$p" 2>/dev/null
+        # mata tambem o filho pacat/cat do grupo
+        [ -n "$p" ] && pkill -P "$p" 2>/dev/null
+        rm -f "$PIDF"
+    fi
+}
+
+case "${1:-start}" in
+    stop)   stop; echo "keepalive parado."; exit 0 ;;
+    status) alive && echo "keepalive ATIVO (pid $(cat "$PIDF"))" || echo "keepalive parado"; exit 0 ;;
+    start|"") : ;;
+    *) echo "uso: say-keepalive [start|stop|status]" >&2; exit 1 ;;
+esac
+
+alive && { echo "keepalive ja ativo (pid $(cat "$PIDF"))."; exit 0; }
+rm -f "$PIDF"
+
+# buffer de ~10s gerado uma vez (loop de 'cat' = wake ~a cada 10s, custo ~0)
+if [ ! -s "$RAW" ] || [ "${KEEPALIVE_REGEN:-0}" = 1 ]; then
+    python3 -c "
+import sys,struct,random
+n=$RATE*10; a=$AMP
+if a<=0: buf=b'\\x00'*(n*2)
+else:    buf=struct.pack('<%dh'%n,*[random.randint(-a,a) for _ in range(n)])
+sys.stdout.buffer.write(buf)
+" > "$RAW" || { echo 'falha ao gerar buffer' >&2; exit 1; }
+fi
+
+setsid bash -c '
+    exec >/dev/null 2>&1
+    while :; do cat "'"$RAW"'"; done \
+    | pacat --playback --device="'"$SINK"'" --rate='"$RATE"' \
+            --format=s16le --channels=1 --raw --client-name=say-keepalive
+' &
+echo $! > "$PIDF"
+sleep 1
+
+if alive; then
+    echo "keepalive iniciado (amp=$AMP, sink=$SINK, pid $(cat "$PIDF"))."
+else
+    rm -f "$PIDF"; echo "falhou ao iniciar keepalive." >&2; exit 1
+fi

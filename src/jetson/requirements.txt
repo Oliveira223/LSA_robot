@@ -1,2 +1,7 @@
+# Captura do microfone (jetson/audio.py) e captura + reprodução do cliente
+# de voz (jetson/audio_client.py, via common/audio_io.py).
 sounddevice>=0.4.6
 numpy>=1.24
+
+# Runtime: sounddevice precisa da lib C do PortAudio no sistema —
+#   sudo apt install -y libportaudio2

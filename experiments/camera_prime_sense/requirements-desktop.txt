@@ -1,0 +1,13 @@
+# Desktop x86_64 com Python 3.8+ (ambiente original do projeto).
+# Na Jetson use requirements.txt.
+
+# GUI
+customtkinter>=5.2.0
+
+# Visão computacional / processamento de imagem
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# Driver / wrapper do sensor (OpenNI2)
+primesense>=2.3.0
