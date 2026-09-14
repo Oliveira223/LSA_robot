@@ -251,10 +251,24 @@ class OuvinteVAD:
 
     def proxima_fala(self, timeout=None):
         # type: (Optional[float]) -> Optional[bytes]
+        """Devolve sempre a frase mais RECENTE. Se quem consome demorou (o
+        `chat_client` so volta a chamar isso depois de mandar pro servidor,
+        receber a resposta e falar ela — um ciclo que pode levar varios
+        segundos), o VAD continua escutando e enfileirando frases novas
+        nesse meio tempo. Sem descartar aqui, o consumidor ficaria
+        respondendo a um backlog de audio velho em vez do que acabou de ser
+        dito — visto na pratica 2026-09-14 (depois de uma reconexao longa,
+        o chat respondeu a falas de minutos atras em vez da mais recente)."""
         try:
             item = self._fila.get(timeout=timeout)
         except queue.Empty:
             return None
+        while True:
+            try:
+                mais_novo = self._fila.get_nowait()
+            except queue.Empty:
+                break
+            item = mais_novo
         return item
 
     def parar(self):

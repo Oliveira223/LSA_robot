@@ -1,13 +1,23 @@
 """
 chat_client.py — orquestra o dialogo por voz da Jetson com o PC (server_voz.py).
 
-Conecta uma vez no PC e, em loop continuo: espera uma frase inteira do
-OuvinteVAD (jetson/mic_vad.py), manda pelo protocolo (common/protocol.py) e
-recebe de volta a transcricao (vira bolha "usuario"), o texto da resposta
-(vira bolha "robo") e, se o TTS estiver disponivel no PC, o audio
-sintetizado — que toca direto no speaker HDMI da Jetson (mesmo sink pinado
-que ja usamos pro say/spotifyd; nao depende do sink padrao do PulseAudio,
-que ja vimos resetar sozinho nessa Jetson).
+Conecta uma vez no PC e mantem DUAS threads independentes na mesma conexao:
+  - envio: espera uma frase inteira do OuvinteVAD (jetson/mic_vad.py) e manda
+    pelo protocolo (common/protocol.py), sem esperar resposta da frase
+    anterior — o mic continua sendo escutado e a proxima frase e mandada
+    assim que estiver pronta, mesmo com uma resposta ainda pendente;
+  - recebimento: le a transcricao (bolha "usuario") e o texto da resposta
+    (bolha "robo") de cada frase, na ordem em que o servidor manda (o TCP
+    garante essa ordem, e o server_voz.py so processa uma frase de cada vez,
+    entao as respostas sempre chegam pareadas com o que foi mandado), e fala
+    a resposta na hora com o Piper (jetson/tts_server.falar()).
+
+Por que duas threads: um socket TCP e full-duplex (dá pra mandar e receber
+ao mesmo tempo sem conflito) — sem isso, o cliente ficava preso esperando a
+resposta (transcricao + resposta do operador + falar) antes de sequer
+capturar a proxima frase, entao falar varias frases em sequencia rapida
+enquanto o operador ainda esta digitando a primeira resposta nao funcionava
+(visto na pratica 2026-09-14).
 
 Mesmo padrao de OuvinteVAD (thread daemon + lock + getter) pra
 Camera_Simples.py poder desenhar a conversa na tela sem bloquear o video.
@@ -21,14 +31,13 @@ Uso (a partir de src/):
 """
 
 import socket
-import subprocess
 import threading
 import time
 
-from common.protocol import AUDIO, recv_msg, send_audio
+from common.protocol import recv_msg, send_audio
 from jetson.mic_vad import ErroDeMic, OuvinteVAD
+from jetson.tts_server import falar
 
-SINK_HDMI = "alsa_output.platform-3510000.hda.hdmi-stereo-extra1"
 MAX_MENSAGENS = 6                  # quantas bolhas manter (as mais recentes)
 RECONEXAO_BACKOFF_S = 2.0
 RECONEXAO_BACKOFF_MAX_S = 30.0
@@ -66,9 +75,12 @@ class ClienteChat:
 
         self._lock = threading.Lock()
         self._mensagens = []
+        self._reconexao_lock = threading.Lock()
         self._rodando = True
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
+        self._thread_envio = threading.Thread(target=self._loop_envio, daemon=True)
+        self._thread_recebimento = threading.Thread(target=self._loop_recebimento, daemon=True)
+        self._thread_envio.start()
+        self._thread_recebimento.start()
 
     def _conectar(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -87,62 +99,60 @@ class ClienteChat:
             if len(self._mensagens) > MAX_MENSAGENS:
                 self._mensagens.pop(0)
 
-    def _loop(self):
+    def _loop_envio(self):
         while self._rodando:
             wav = self._ouvinte.proxima_fala(timeout=1.0)
             if wav is None:
                 continue
-
+            sock = self._sock
             try:
-                send_audio(self._sock, wav)
+                send_audio(sock, wav)
+            except (OSError, ValueError) as e:
+                if not self._rodando:
+                    break
+                print("[chat_client] erro ao enviar audio: %s" % e, flush=True)
+                self._reconectar_com_backoff(sock)
 
-                msg_transcricao = recv_msg(self._sock)
+    def _loop_recebimento(self):
+        while self._rodando:
+            sock = self._sock
+            try:
+                msg_transcricao = recv_msg(sock)
                 if msg_transcricao is None:
                     raise ConnectionError("servidor fechou a conexao")
                 self._adicionar("usuario", msg_transcricao.texto)
 
-                msg_resposta = recv_msg(self._sock)
+                msg_resposta = recv_msg(sock)
                 if msg_resposta is None:
                     raise ConnectionError("servidor fechou a conexao")
                 self._adicionar("robo", msg_resposta.texto)
-
-                msg_audio = recv_msg(self._sock)
-                if msg_audio is not None and msg_audio.tipo == AUDIO:
-                    self._tocar(msg_audio.dados)
+                falar(msg_resposta.texto)
             except (OSError, ValueError) as e:
                 if not self._rodando:
                     break
                 print("[chat_client] erro na conexao: %s" % e, flush=True)
-                self._reconectar_com_backoff()
+                self._reconectar_com_backoff(sock)
 
-    def _tocar(self, wav_bytes):
-        try:
-            proc = subprocess.Popen(
-                ["paplay", "--device=%s" % SINK_HDMI],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            proc.communicate(wav_bytes, timeout=30)
-        except Exception as e:
-            print("[chat_client] falha ao tocar resposta: %s" % e, flush=True)
-
-    def _reconectar_com_backoff(self):
-        try:
-            self._sock.close()
-        except Exception:
-            pass
-        espera = RECONEXAO_BACKOFF_S
-        while self._rodando:
-            print("[chat_client] tentando reconectar em %.0fs..." % espera, flush=True)
-            time.sleep(espera)
-            if not self._rodando:
-                return
+    def _reconectar_com_backoff(self, sock_com_erro):
+        with self._reconexao_lock:
+            if sock_com_erro is not self._sock:
+                return  # a outra thread (envio ou recebimento) ja reconectou
             try:
-                self._sock = self._conectar()
-                print("[chat_client] reconectado", flush=True)
-                return
-            except OSError:
-                espera = min(espera * 2, RECONEXAO_BACKOFF_MAX_S)
+                self._sock.close()
+            except Exception:
+                pass
+            espera = RECONEXAO_BACKOFF_S
+            while self._rodando:
+                print("[chat_client] tentando reconectar em %.0fs..." % espera, flush=True)
+                time.sleep(espera)
+                if not self._rodando:
+                    return
+                try:
+                    self._sock = self._conectar()
+                    print("[chat_client] reconectado", flush=True)
+                    return
+                except OSError:
+                    espera = min(espera * 2, RECONEXAO_BACKOFF_MAX_S)
 
     def parar(self):
         self._rodando = False
@@ -152,7 +162,8 @@ class ClienteChat:
             self._sock.close()
         except Exception:
             pass
-        self._thread.join(timeout=2)
+        self._thread_envio.join(timeout=2)
+        self._thread_recebimento.join(timeout=2)
 
 
 if __name__ == "__main__":

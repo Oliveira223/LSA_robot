@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# server-voz - inicia o pc.server_voz (etapa d2: audio da Jetson -> texto ->
+# operador digita a resposta -> texto de volta; a Jetson fala a resposta com
+# Piper). Ativa o venv do projeto se existir, e por padrao escuta em TODAS
+# as interfaces (0.0.0.0), nao so localhost — a Jetson conecta pela rede.
+#
+#   ./server-voz                inicia em 0.0.0.0:5000 (padrao)
+#   ./server-voz <porta>        troca so a porta (ex: ./server-voz 5050)
+#   ./server-voz <host> <porta> troca host e porta
+#
+# Variaveis uteis (exportar antes de chamar, se quiser mudar o padrao):
+#   LSA_WHISPER_MODEL=base    faster-whisper mais leve/rapido (padrao: small)
+#   LSA_WHISPER_MODEL=tiny    ainda mais rapido, menos preciso
+set -eu
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+VENV="$REPO_ROOT/.venv"
+
+if [ -x "$VENV/bin/python" ]; then
+    PY="$VENV/bin/python"
+else
+    echo "AVISO: venv nao encontrado em $VENV — usando 'python3' do sistema." >&2
+    echo "       Se faltar dependencia (faster-whisper, sounddevice...), crie o venv:" >&2
+    echo "         cd $REPO_ROOT && python3 -m venv .venv && . .venv/bin/activate && pip install -r src/pc/requirements.txt" >&2
+    PY="python3"
+fi
+
+if [ "$#" -eq 2 ]; then
+    HOST="$1"; PORTA="$2"
+elif [ "$#" -eq 1 ]; then
+    HOST="0.0.0.0"; PORTA="$1"
+elif [ "$#" -eq 0 ]; then
+    HOST="0.0.0.0"; PORTA="5000"
+else
+    echo "uso: $(basename "$0") [host] [porta]" >&2
+    exit 1
+fi
+
+cd "$REPO_ROOT/src"
+echo "server-voz: escutando em $HOST:$PORTA (Ctrl-C para sair)"
+exec "$PY" -m pc.server_voz "$HOST" "$PORTA"

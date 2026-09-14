@@ -1,5 +1,5 @@
 """
-server_voz.py — servidor da etapa (d2): áudio → texto → resposta em voz.
+server_voz.py — servidor da etapa (d2): áudio → texto → resposta.
 
 Fluxo por mensagem recebida da Jetson:
   1. recebe um WAV (mensagem do tipo AUDIO);
@@ -10,20 +10,21 @@ Fluxo por mensagem recebida da Jetson:
   4. chama pc.cerebro.responder() — por ora um OPERADOR HUMANO digita a
      resposta, simulando a IA;
   5. devolve o texto da resposta como mensagem TEXTO (pra bolha "robo" na
-     tela) e, em seguida, tenta sintetizar com espeak-ng (pc.tts) e manda
-     como mensagem AUDIO extra pra Jetson tocar no speaker. Se o TTS não
-     estiver disponível, só as duas mensagens TEXTO chegam (sem áudio).
+     tela). A Jetson que fala a resposta em voz (jetson/chat_client.py
+     chama jetson/bin/say — Piper — localmente) — este servidor não
+     sintetiza áudio, só manda texto.
 
 Por mensagem de áudio recebida, o cliente sempre recebe 2 mensagens TEXTO
-(transcrição, depois resposta) e, se o TTS estiver disponível, uma 3a
-mensagem AUDIO com a resposta em voz. jetson/audio_client.py (cliente antigo
-de teclado, só lê 1 mensagem) fica desatualizado por essa mudança — não foi
+(transcrição, depois resposta). jetson/audio_client.py (cliente antigo de
+teclado, só lê 1 mensagem) fica desatualizado por essa mudança — não foi
 corrigido porque já não importa no Python 3.6 da Jetson de qualquer forma.
 
 O passo 4 é o ponto que, mais adiante, vira uma chamada de IA de verdade
 (regras + modelo) — trocar pc/cerebro.py não exige mexer neste arquivo.
-A síntese de voz roda aqui no PC de propósito: a Jetson não tem motor de
-TTS (ver docs/roadmap-comunicacao.md, Fase 4).
+pc/tts.py (espeak-ng) fica sem uso por este servidor: a voz de saída
+migrou pra Jetson (Piper, melhor que o espeak-ng — mesma decisão do
+jetson/tts_server.py da arquitetura invertida, só que aplicada aqui em
+cima do mic da própria Jetson em vez do mic do PC).
 
 Uso (a partir de src/):
     python -m pc.server_voz [host] [porta]
@@ -37,8 +38,8 @@ import socket
 import sys
 import tempfile
 
-from common.protocol import AUDIO, recv_msg, send_audio, send_texto
-from pc import stt, tts
+from common.protocol import AUDIO, recv_msg, send_texto
+from pc import stt
 from pc.cerebro import responder
 
 
@@ -57,43 +58,43 @@ def _transcrever_bytes(wav_bytes: bytes) -> str:
 
 
 def atender(conexao: socket.socket) -> None:
-    """Loop de mensagens de um cliente já conectado."""
+    """Loop de mensagens de um cliente já conectado.
+
+    Tudo que toca o socket (recv E send) fica dentro do mesmo try/except:
+    a Jetson pode cair no meio de um ciclo (ex.: reiniciou o app bem na
+    hora que o operador ia responder) — sem isso, um send() pra uma conexão
+    já morta derrubava o processo do servidor inteiro em vez de só encerrar
+    essa conversa e voltar a esperar o próximo cliente (visto na prática
+    2026-09-14: ConnectionResetError em send_texto matou o server_voz)."""
     while True:
         try:
             msg = recv_msg(conexao)
-        except (ConnectionResetError, ValueError) as e:
+            if msg is None:
+                print("[servidor] cliente desconectou")
+                return
+            if msg.tipo != AUDIO:
+                print(f"[servidor] mensagem ignorada (esperava AUDIO, veio tipo {msg.tipo})")
+                continue
+
+            print(f"[servidor] audio recebido: {len(msg.dados)} bytes", flush=True)
+            try:
+                texto = _transcrever_bytes(msg.dados)
+            except stt.ErroDeSTT as e:
+                print(f"[servidor] erro de transcricao: {e}")
+                send_texto(conexao, "")
+                send_texto(conexao, "(desculpe, nao consegui entender o audio)")
+                continue
+
+            if not texto:
+                print("[servidor] nada foi transcrito — o audio pode estar sem fala")
+            send_texto(conexao, texto)
+
+            resposta = responder(texto)
+            print(f"[servidor] resposta: {resposta!r}")
+            send_texto(conexao, resposta)
+        except (OSError, ValueError) as e:
             print(f"[servidor] erro na conexao: {e}")
             return
-        if msg is None:
-            print("[servidor] cliente desconectou")
-            return
-        if msg.tipo != AUDIO:
-            print(f"[servidor] mensagem ignorada (esperava AUDIO, veio tipo {msg.tipo})")
-            continue
-
-        print(f"[servidor] audio recebido: {len(msg.dados)} bytes", flush=True)
-        try:
-            texto = _transcrever_bytes(msg.dados)
-        except stt.ErroDeSTT as e:
-            print(f"[servidor] erro de transcricao: {e}")
-            send_texto(conexao, "")
-            send_texto(conexao, "(desculpe, nao consegui entender o audio)")
-            continue
-
-        if not texto:
-            print("[servidor] nada foi transcrito — o audio pode estar sem fala")
-        send_texto(conexao, texto)
-
-        resposta = responder(texto)
-        print(f"[servidor] resposta: {resposta!r}")
-        send_texto(conexao, resposta)
-        try:
-            wav = tts.sintetizar(resposta)
-        except tts.ErroDeTTS as e:
-            print(f"[servidor] TTS indisponivel ({e}); resposta so foi enviada como texto")
-            continue
-        send_audio(conexao, wav)
-        print(f"[servidor] resposta enviada em voz: {len(wav)} bytes", flush=True)
 
 
 def main() -> None:
@@ -105,10 +106,7 @@ def main() -> None:
     servidor.bind((host, porta))
     servidor.listen(1)
     print(f"[servidor] escutando em {host}:{porta} (Ctrl-C para sair)")
-    print("[servidor] modo voz: transcreve o audio, voce digita a resposta, ela volta em voz")
-    if not tts.disponivel():
-        print("[servidor] AVISO: espeak-ng nao encontrado — a resposta voltara como texto.")
-        print("[servidor]        instale com: sudo apt install -y espeak-ng")
+    print("[servidor] modo voz: transcreve o audio, voce digita a resposta; a Jetson fala")
 
     try:
         while True:
