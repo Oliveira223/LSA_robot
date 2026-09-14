@@ -16,11 +16,10 @@ byte de tipo na frente. O enquadramento por tamanho continua igual: é o
 que garante que um WAV grande chegue inteiro, mesmo picado em vários recv().
 """
 
-from __future__ import annotations
-
 import socket
 import struct
 from collections import namedtuple
+from typing import Optional
 
 # ">" = big-endian; "B" = 1 byte sem sinal (tipo); "I" = 4 bytes sem sinal (tamanho).
 _HEADER = struct.Struct(">BI")
@@ -68,7 +67,7 @@ def send_audio(sock: socket.socket, dados: bytes) -> None:
     _enviar(sock, AUDIO, dados)
 
 
-def recv_msg(sock: socket.socket) -> Mensagem | None:
+def recv_msg(sock: socket.socket) -> Optional[Mensagem]:
     """
     Recebe uma mensagem enquadrada e devolve um Mensagem(tipo, dados).
 
@@ -91,7 +90,7 @@ def recv_msg(sock: socket.socket) -> Mensagem | None:
     return Mensagem(tipo, payload)
 
 
-def _recv_exato(sock: socket.socket, n: int) -> bytes | None:
+def _recv_exato(sock: socket.socket, n: int) -> Optional[bytes]:
     """Lê exatamente n bytes do socket, ou None se a conexão fechar antes."""
     buf = bytearray()
     while len(buf) < n:

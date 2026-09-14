@@ -390,3 +390,70 @@ manda. Ver [`docs/roadmap-comunicacao.md`](docs/roadmap-comunicacao.md) (Fase 4)
   `jetson.audio_client` em localhost e validar o ciclo de voz de ponta a ponta.
 - Depois: mesmo loop pelo túnel SSH quando a Jetson tiver mic/speaker;
   então trocar `pc/cerebro.py` por regras + IA.
+
+---
+
+## 2026-09-14
+
+### Inversão do pipeline de voz: mic no PC, resposta falada pela Jetson (Piper)
+
+**Contexto:** a Jetson já tem mic e speaker reais funcionando (PrimeSense +
+HDMI, ver bring-up de 2026-09-10) e já existia neste checkout um WIP não
+commitado (`jetson/mic_vad.py` + `jetson/chat_client.py`) implementando o
+caminho original: mic da Jetson → PC transcreve/decide/sintetiza
+(espeak-ng) → Jetson só toca o áudio recebido. Decidido inverter essa
+etapa: o mic passa a ser o do PC, e quem fala a resposta passa a ser a
+Jetson (Piper, via `jetson/bin/say`), não o PC.
+
+**Por que:** o mic da Jetson (PrimeSense) disputa a mesma interface USB
+com a câmera — abrir os dois ao mesmo tempo trava a interface de áudio
+(ver nota em `Camera_Simples.iniciar_sensor`, mesmo arquivo com mudanças
+locais não commitadas). E o TTS local da Jetson (Piper) já soa bem melhor
+que o espeak-ng do PC (`pc/tts.py`). "Por enquanto" — não é a arquitetura
+final, é um jeito de testar sem o conflito de USB e com voz melhor.
+
+**O que foi feito**
+- `src/jetson/tts_server.py` (novo) — servidor TCP na Jetson (porta 5001
+  por padrão, para conviver com a porta 5000 do `pc.server_voz`), recebe
+  mensagem TEXTO e fala com `jetson/bin/say -1 "<texto>"` (Piper) no
+  speaker HDMI. Python 3.6 (sem `from __future__ import annotations`,
+  mesma regra de `mic_vad.py`/`chat_client.py`).
+- `src/pc/voice_client.py` (novo) — cliente TCP no PC: grava o mic do PC
+  (ENTER/ENTER, reaproveitando `common.audio_io.Gravador`, igual
+  `push_to_talk.py`), transcreve com `pc.stt`, chama
+  `pc.cerebro.responder()` (operador humano digita a resposta, sem
+  mudança nessa parte) e manda o texto da resposta pra Jetson falar.
+- `src/pc/push_to_talk.py` — `_preparar` virou `preparar_audio` (função
+  pública) só para `voice_client.py` poder reaproveitar a normalização de
+  mic fraco sem duplicar o código.
+
+**Decisão importante:** o "cérebro" continua no PC (operador digita a
+resposta ali, onde já está vendo a transcrição) — não foi portado pra
+Jetson. A Jetson só recebe o texto pronto e fala; isso manteve a mudança
+pequena (dois arquivos novos, nenhum protocolo novo — reaproveita TEXTO
+de `common/protocol.py`).
+
+**O que funcionou / não funcionou**
+- ✅ Teste local na própria Jetson: `jetson.tts_server` em
+  `127.0.0.1:5001` + um cliente de teste mandando TEXTO pelo protocolo —
+  o servidor chamou `say -1`, falou e só devolveu o ack ("ok") depois da
+  fala terminar, sem erro no log.
+- ⏳ Não testado ainda de verdade PC↔Jetson pela rede (só localhost na
+  Jetson). IP da Jetson na rede local hoje: `192.168.0.103` (WiFi) /
+  `100.116.50.67` (Tailscale) — usar num dos dois como argumento de
+  `pc.voice_client`.
+
+**Pendência importante:** estes arquivos (e a mudança em
+`push_to_talk.py`) existem só nesta cópia da Jetson — não foram
+commitados nem empurrados. A convenção do projeto é a Jetson só *puxar*
+git (commits são feitos no notebook) — então rodar isso a partir de um
+notebook exige ou commitar+empurrar a partir daqui (fora da convenção
+usual), ou copiar os arquivos novos pro notebook manualmente e commitar
+de lá como de costume.
+
+**Próximo passo planejado**
+- Rodar `pc.voice_client <ip-da-jetson>` de um notebook de verdade contra
+  `jetson.tts_server` rodando na Jetson, validar o ciclo completo.
+- Decidir o destino do WIP `mic_vad.py`/`chat_client.py` (caminho
+  original, mic na Jetson) — manter como alternativa ou descartar depois
+  que a inversão for validada.

@@ -33,8 +33,11 @@ from common.audio_io import Cronometro, Gravador
 from pc import stt
 
 
-def _preparar(audio: np.ndarray) -> tuple[np.ndarray, float, float]:
-    """Normaliza sinal fraco. Devolve (audio_tratado, pico_original, ganho_aplicado)."""
+def preparar_audio(audio: np.ndarray) -> tuple[np.ndarray, float, float]:
+    """Normaliza sinal fraco. Devolve (audio_tratado, pico_original, ganho_aplicado).
+
+    Reaproveitado por pc/voice_client.py — mesmo problema de mic fraco.
+    """
     if audio.size == 0:
         return audio, 0.0, 1.0
     pico = float(np.abs(audio).max())
@@ -64,7 +67,7 @@ def _listar_entradas():
 def _uma_rodada(grav: "Gravador") -> None:
     audio = grav.parar()
     dur = audio.size / grav.taxa
-    tratado, pico, ganho = _preparar(audio)
+    tratado, pico, ganho = preparar_audio(audio)
 
     if dur < 0.3:
         print("  (muito curto)")

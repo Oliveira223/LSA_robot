@@ -38,6 +38,26 @@ import numpy as np
 from primesense import openni2
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# jetson.mic_vad (e, mais adiante, jetson.chat_client) vivem no repo
+# LSA_robot, fora dessa pasta — ver README do Desktop sobre a divisao
+# repo-vs-app-rodando. Import defensivo: sem o mic, a camera continua
+# funcionando normalmente (mesmo espirito do detector de rosto ausente).
+sys.path.insert(0, os.path.expanduser("~/dev/LSA_robot/src"))
+try:
+    from jetson.mic_vad import OuvinteVAD, ErroDeMic
+except Exception as _erro_import_mic:
+    OuvinteVAD = None
+    ErroDeMic = Exception
+    print(f"AVISO: jetson.mic_vad indisponivel ({_erro_import_mic}); "
+          "seguindo sem indicador de microfone.", file=sys.stderr)
+try:
+    from jetson.chat_client import ClienteChat, ErroDeChat
+except Exception as _erro_import_chat:
+    ClienteChat = None
+    ErroDeChat = Exception
+    print(f"AVISO: jetson.chat_client indisponivel ({_erro_import_chat}); "
+          "seguindo sem chat.", file=sys.stderr)
 FACE_CFG = os.path.join(BASE_DIR, "cfg", "yolov3-face.cfg")
 FACE_WEIGHTS = os.path.join(BASE_DIR, "model-weights", "yolov3-wider_16000.weights")
 
@@ -174,13 +194,20 @@ def localizar_openni2_redist():
 
 
 # ─── Sensor ─────────────────────────────────────────────────────────────
-def iniciar_sensor():
+def iniciar_sensor(usar_profundidade=True):
+    """`usar_profundidade=False` nem cria o stream de profundidade — a
+    leitura+colorizacao (inpaint, Canny, normalizacao por percentil) tem um
+    custo de CPU real por frame, fora do fato de ser a parte mais instavel
+    do sensor nessa Jetson (trava/precisa de replug com frequencia). Quem
+    so quer RGB+rosto fica livre desse custo e dessa instabilidade."""
     openni2.initialize(localizar_openni2_redist())
     dev = openni2.Device.open_any()
     color_stream = dev.create_color_stream()
-    depth_stream = dev.create_depth_stream()
     color_stream.start()
-    depth_stream.start()
+    depth_stream = None
+    if usar_profundidade:
+        depth_stream = dev.create_depth_stream()
+        depth_stream.start()
     return dev, color_stream, depth_stream
 
 
@@ -204,7 +231,7 @@ def ler_color(color_stream):
     return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
 
-def ler_depth_colorido(depth_stream, colormap=cv2.COLORMAP_INFERNO):
+def ler_depth_colorido(depth_stream, colormap=cv2.COLORMAP_PLASMA):
     """Colorizacao com apelo visual/HUD (proposital, nao fidelidade metrica):
     normaliza por percentil (em vez de min/max puro) pra nao estourar o
     frame inteiro numa unica mancha quando ha poucos pixels validos (vidro,
@@ -273,7 +300,6 @@ class LeitorProfundidade:
             try:
                 prof = ler_depth_colorido(self._depth_stream)
             except Exception:
-                import traceback; traceback.print_exc()
                 time.sleep(0.2)  # evita spin de CPU quando a leitura falha
                 continue
             with self._lock:
@@ -323,6 +349,142 @@ def compor_picture_in_picture(fundo, mini, canto="br", margem=20, escala=0.28,
     return saida
 
 
+def desenhar_mic_hud(fundo, ouvinte, x=20, y=None, largura=260, altura=14):
+    """Medidor de nivel do microfone (RMS atual vs limiar de fala), estilo
+    HUD, canto inferior esquerdo. `ouvinte` e um jetson.mic_vad.OuvinteVAD
+    (ou None — nesse caso nao desenha nada)."""
+    if ouvinte is None:
+        return fundo
+
+    cor_hud = (255, 220, 0)      # ciano, mesma paleta dos outros paineis
+    cor_fala = (0, 255, 80)      # verde quando acima do limiar (falando)
+    cor_offline = (0, 0, 255)    # vermelho — parou de verdade, nao e so silencio
+
+    nivel, limiar, gravando, vivo = ouvinte.estado()
+    h, w = fundo.shape[:2]
+    if y is None:
+        y = h - altura - 20
+
+    saida = fundo
+    # fundo semi-transparente atras da barra, pra legibilidade
+    faixa = saida[y - 18:y + altura + 4, x - 6:x + largura + 6].copy()
+    cv2.rectangle(faixa, (0, 0), (faixa.shape[1], faixa.shape[0]), (0, 0, 0), -1)
+    saida[y - 18:y + altura + 4, x - 6:x + largura + 6] = cv2.addWeighted(
+        faixa, 0.45, saida[y - 18:y + altura + 4, x - 6:x + largura + 6], 0.55, 0)
+
+    if not vivo:
+        cv2.rectangle(saida, (x, y), (x + largura, y + altura), cor_offline, 1, cv2.LINE_AA)
+        cv2.putText(saida, "MIC OFFLINE", (x, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    cor_offline, 1, cv2.LINE_AA)
+        return saida
+
+    cv2.rectangle(saida, (x, y), (x + largura, y + altura), cor_hud, 1, cv2.LINE_AA)
+
+    # escala nao-linear (raiz) pra RMS baixo nao ficar ilegivel espremido
+    teto = max(limiar * 3, 1500)
+    frac = min((nivel / teto) ** 0.5, 1.0) if teto else 0.0
+    cor_barra = cor_fala if gravando else cor_hud
+    if frac > 0:
+        cv2.rectangle(saida, (x + 1, y + 1),
+                      (x + 1 + int(frac * (largura - 2)), y + altura - 1),
+                      cor_barra, -1)
+
+    # marca a posicao do limiar na barra
+    frac_limiar = min((limiar / teto) ** 0.5, 1.0) if teto else 0.0
+    xl = x + int(frac_limiar * (largura - 2))
+    cv2.line(saida, (xl, y - 3), (xl, y + altura + 3), (0, 0, 255), 1, cv2.LINE_AA)
+
+    estado_txt = "OUVINDO..." if gravando else "MIC"
+    cv2.putText(saida, estado_txt, (x, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                cor_barra, 1, cv2.LINE_AA)
+
+    return saida
+
+
+def _quebrar_linhas(texto, largura_max_px, fonte, escala, espessura):
+    """Quebra `texto` em linhas que cabem em `largura_max_px` (usa
+    cv2.getTextSize pra medir de verdade em vez de contar caracteres)."""
+    palavras = texto.split()
+    linhas = []
+    atual = ""
+    for palavra in palavras:
+        candidato = (atual + " " + palavra).strip()
+        (lw, _), _ = cv2.getTextSize(candidato, fonte, escala, espessura)
+        if lw <= largura_max_px or not atual:
+            atual = candidato
+        else:
+            linhas.append(atual)
+            atual = palavra
+    if atual:
+        linhas.append(atual)
+    return linhas or [""]
+
+
+def desenhar_chat(fundo, mensagens, margem=20, altura_frac=0.5, largura_frac=0.32):
+    """Painel de chat estilo HUD no canto superior direito, ate ~metade da
+    altura da tela. Mensagens do usuario (transcritas do mic) alinhadas a
+    ESQUERDA do painel, respostas do robo a DIREITA. `mensagens` e uma
+    lista de (autor, texto) com autor "usuario"/"robo", mais recente por
+    ultimo (mesmo formato de jetson.chat_client.ClienteChat.mensagens())."""
+    if not mensagens:
+        return fundo
+
+    cor_hud = (255, 220, 0)      # ciano, mesma paleta dos outros paineis
+    cor_robo = (120, 255, 120)   # verde suave, so pra diferenciar do usuario
+    fonte = cv2.FONT_HERSHEY_SIMPLEX
+    escala = 0.5
+    espessura = 1
+    altura_linha = 22
+    pad = 12
+
+    h, w = fundo.shape[:2]
+    py = margem
+    pw = int(w * largura_frac)
+    ph = int(h * altura_frac)
+    x0 = w - pw - margem
+    x1 = w - margem
+
+    saida = fundo
+    regiao = saida[py:py + ph, x0:x1].copy()
+    cv2.rectangle(regiao, (0, 0), (regiao.shape[1], regiao.shape[0]), (0, 0, 0), -1)
+    saida[py:py + ph, x0:x1] = cv2.addWeighted(regiao, 0.45, saida[py:py + ph, x0:x1], 0.55, 0)
+
+    cv2.rectangle(saida, (x0, py), (x1, py + ph), cor_hud, 1, cv2.LINE_AA)
+    tick = 14
+    for (cx, cy, dx, dy) in [(x0, py, 1, 1), (x1, py, -1, 1),
+                              (x0, py + ph, 1, -1), (x1, py + ph, -1, -1)]:
+        cv2.line(saida, (cx, cy), (cx + dx * tick, cy), cor_hud, 2, cv2.LINE_AA)
+        cv2.line(saida, (cx, cy), (cx, cy + dy * tick), cor_hud, 2, cv2.LINE_AA)
+    cv2.putText(saida, "CHAT", (x0, py - 8), fonte, 0.5, cor_hud, 1, cv2.LINE_AA)
+
+    # monta os blocos de baixo pra cima (mais recente primeiro) ate estourar
+    # a altura do painel, depois desenha em ordem cronologica normal
+    largura_max_px = pw - 2 * pad
+    blocos = []
+    altura_usada = 0
+    for autor, texto in reversed(mensagens):
+        linhas = _quebrar_linhas(texto or "(vazio)", largura_max_px, fonte, escala, espessura)[:4]
+        altura_bloco = len(linhas) * altura_linha + 8
+        if altura_usada + altura_bloco > ph - 2 * pad:
+            break
+        blocos.append((autor, linhas))
+        altura_usada += altura_bloco
+    blocos.reverse()
+
+    y = py + ph - pad - altura_usada
+    for autor, linhas in blocos:
+        cor = cor_hud if autor == "usuario" else cor_robo
+        for linha in linhas:
+            (lw, _), _ = cv2.getTextSize(linha, fonte, escala, espessura)
+            tx = x0 + pad if autor == "usuario" else x1 - pad - lw
+            cv2.putText(saida, linha, (tx, y + altura_linha - 6), fonte, escala,
+                        cor, espessura, cv2.LINE_AA)
+            y += altura_linha
+        y += 8
+
+    return saida
+
+
 # ─── Janela em tela cheia ───────────────────────────────────────────────
 def tamanho_tela_cheia():
     """Resolução do monitor via xrandr; usa 1920x1080 se não conseguir."""
@@ -358,11 +520,25 @@ def main():
     ap.add_argument("--windowed", action="store_true",
                      help="abre em janela normal em vez de tela cheia")
     ap.add_argument("--no-faces", action="store_true",
-                     help="desliga a deteccao de rosto (YOLOv3-face)")
+                     help="desliga a deteccao de rosto (YOLOv3-face; roda em processo a parte, "
+                          "~1 deteccao/seg, mas ainda consome uma CPU inteira)")
     ap.add_argument("--face-size", type=int, default=160,
                      help="entrada da rede YOLO em pixels (padrao 160; menor = mais rapido)")
     ap.add_argument("--face-conf", type=float, default=0.5,
                      help="confianca minima da deteccao de rosto (padrao 0.5)")
+    ap.add_argument("--no-depth", action="store_true",
+                     help="desliga o stream de profundidade (nem abre o sensor de profundidade "
+                          "— e a parte mais pesada/instavel; so RGB+rosto)")
+    ap.add_argument("--no-mic", action="store_true",
+                     help="desliga o indicador de nivel do microfone")
+    ap.add_argument("--mic-limiar", type=int, default=None,
+                     help="limiar de RMS pra considerar 'falando' (ajuste fino do VAD)")
+    ap.add_argument("--no-chat", action="store_true",
+                     help="desliga o chat por voz com o PC (so fica o indicador de mic)")
+    ap.add_argument("--chat-host", default="127.0.0.1",
+                     help="IP do PC rodando pc.server_voz (padrao 127.0.0.1)")
+    ap.add_argument("--chat-port", type=int, default=5000,
+                     help="porta do pc.server_voz (padrao 5000)")
     args = ap.parse_args()
 
     detector = None
@@ -374,8 +550,35 @@ def main():
             print(f"AVISO: modelo YOLO de rosto nao encontrado ({FACE_CFG} / "
                   f"{FACE_WEIGHTS}); seguindo sem deteccao de rosto.", file=sys.stderr)
 
-    _dev, color_stream, depth_stream = iniciar_sensor()
-    leitor_profundidade = LeitorProfundidade(depth_stream)
+    # OpenNI2 abre a interface de video/profundidade da PrimeSense PRIMEIRO,
+    # sem nada mais mexendo no mesmo dispositivo USB ao mesmo tempo — visto
+    # na pratica 2026-09-14 que abrir o mic (arecord -l + Popen) concorrente
+    # com o Device.open_any() do OpenNI2 deixa a interface de audio travada
+    # (arecord -l trava mesmo, precisa de replug fisico pra voltar). So
+    # inicializa o mic/chat DEPOIS do sensor de video estar de pe.
+    _dev, color_stream, depth_stream = iniciar_sensor(usar_profundidade=not args.no_depth)
+    leitor_profundidade = LeitorProfundidade(depth_stream) if depth_stream else None
+
+    ouvinte = None
+    if not args.no_mic and OuvinteVAD is not None:
+        try:
+            kwargs = {"limiar_fala": args.mic_limiar} if args.mic_limiar else {}
+            ouvinte = OuvinteVAD(**kwargs)
+        except ErroDeMic as e:
+            print(f"AVISO: microfone indisponivel ({e}); seguindo sem indicador de mic.",
+                  file=sys.stderr)
+
+    cliente_chat = None
+    if not args.no_chat and ClienteChat is not None:
+        if ouvinte is None:
+            print("AVISO: sem microfone, seguindo sem chat.", file=sys.stderr)
+        else:
+            try:
+                # reaproveita o mesmo OuvinteVAD do indicador de mic — so pode
+                # ter um arecord por vez no hw:2,0.
+                cliente_chat = ClienteChat(args.chat_host, args.chat_port, ouvinte=ouvinte)
+            except ErroDeChat as e:
+                print(f"AVISO: chat indisponivel ({e}); seguindo sem chat.", file=sys.stderr)
 
     largura, altura = (960, 720) if args.windowed else tamanho_tela_cheia()
 
@@ -401,9 +604,13 @@ def main():
                 detector.submit(cor.copy())
                 desenhar_rostos(cor, detector.boxes())
 
-            profundidade = leitor_profundidade.ultimo_frame()
-
-            quadro = compor_picture_in_picture(cor, profundidade, canto=args.corner)
+            quadro = cor
+            if leitor_profundidade:
+                profundidade = leitor_profundidade.ultimo_frame()
+                quadro = compor_picture_in_picture(quadro, profundidade, canto=args.corner)
+            quadro = desenhar_mic_hud(quadro, ouvinte)
+            if cliente_chat:
+                quadro = desenhar_chat(quadro, cliente_chat.mensagens())
             cv2.imshow(janela, quadro)
 
             if primeiro_frame:
@@ -418,7 +625,12 @@ def main():
     finally:
         if detector:
             detector.parar()
-        leitor_profundidade.parar()
+        if cliente_chat:
+            cliente_chat.parar()
+        if ouvinte:
+            ouvinte.parar()
+        if leitor_profundidade:
+            leitor_profundidade.parar()
         parar_sensor(color_stream, depth_stream)
         cv2.destroyAllWindows()
 

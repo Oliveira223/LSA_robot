@@ -4,12 +4,21 @@ server_voz.py — servidor da etapa (d2): áudio → texto → resposta em voz.
 Fluxo por mensagem recebida da Jetson:
   1. recebe um WAV (mensagem do tipo AUDIO);
   2. transcreve com faster-whisper (stt.transcrever);
-  3. mostra a transcrição no terminal;
+  3. devolve a transcrição pra Jetson como mensagem TEXTO — o cliente de
+     chat (jetson/chat_client.py) usa isso pra mostrar a bolha "usuario"
+     na tela sem transcrever de novo localmente;
   4. chama pc.cerebro.responder() — por ora um OPERADOR HUMANO digita a
      resposta, simulando a IA;
-  5. sintetiza a resposta com espeak-ng (pc.tts) e devolve como mensagem
-     AUDIO para a Jetson, que só toca no speaker. Se o TTS não estiver
-     disponível, cai para enviar a resposta como texto puro.
+  5. devolve o texto da resposta como mensagem TEXTO (pra bolha "robo" na
+     tela) e, em seguida, tenta sintetizar com espeak-ng (pc.tts) e manda
+     como mensagem AUDIO extra pra Jetson tocar no speaker. Se o TTS não
+     estiver disponível, só as duas mensagens TEXTO chegam (sem áudio).
+
+Por mensagem de áudio recebida, o cliente sempre recebe 2 mensagens TEXTO
+(transcrição, depois resposta) e, se o TTS estiver disponível, uma 3a
+mensagem AUDIO com a resposta em voz. jetson/audio_client.py (cliente antigo
+de teclado, só lê 1 mensagem) fica desatualizado por essa mudança — não foi
+corrigido porque já não importa no Python 3.6 da Jetson de qualquer forma.
 
 O passo 4 é o ponto que, mais adiante, vira uma chamada de IA de verdade
 (regras + modelo) — trocar pc/cerebro.py não exige mexer neste arquivo.
@@ -67,19 +76,21 @@ def atender(conexao: socket.socket) -> None:
             texto = _transcrever_bytes(msg.dados)
         except stt.ErroDeSTT as e:
             print(f"[servidor] erro de transcricao: {e}")
+            send_texto(conexao, "")
             send_texto(conexao, "(desculpe, nao consegui entender o audio)")
             continue
 
         if not texto:
             print("[servidor] nada foi transcrito — o audio pode estar sem fala")
+        send_texto(conexao, texto)
 
         resposta = responder(texto)
         print(f"[servidor] resposta: {resposta!r}")
+        send_texto(conexao, resposta)
         try:
             wav = tts.sintetizar(resposta)
         except tts.ErroDeTTS as e:
-            print(f"[servidor] TTS indisponivel ({e}); enviando resposta como texto")
-            send_texto(conexao, resposta)
+            print(f"[servidor] TTS indisponivel ({e}); resposta so foi enviada como texto")
             continue
         send_audio(conexao, wav)
         print(f"[servidor] resposta enviada em voz: {len(wav)} bytes", flush=True)

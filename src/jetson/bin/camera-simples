@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # camera-simples - gerencia a tela da PrimeSense (Camera_Simples.py: RGB em
 # tela cheia + profundidade em miniatura + bounding box de rosto via YOLO)
-# na tela fisica da Jetson (HDMI, DISPLAY :1).
+# na tela fisica da Jetson (HDMI). O numero do DISPLAY (:0, :1, ...) muda
+# conforme o boot, entao e detectado automaticamente a partir do socket X
+# ativo em /tmp/.X11-unix (fallback pra :0 se nada for encontrado).
 #
 #   ./camera-simples            reinicia (para + reseta USB + abre de novo)
 #   ./camera-simples start      so abre (nao mexe em processo/USB antes)
@@ -21,7 +23,8 @@
 # de abrir de novo. Esse script automatiza os dois passos.
 set -u
 
-DISP=":1"
+DISP_NUM="$(ls /tmp/.X11-unix/ 2>/dev/null | sed -n 's/^X//p' | head -n1)"
+DISP=":${DISP_NUM:-0}"
 APPDIR="$HOME/dev/Camera-prime-sense"
 PY="$APPDIR/venv/bin/python"
 APP="$APPDIR/Camera_Simples.py"
