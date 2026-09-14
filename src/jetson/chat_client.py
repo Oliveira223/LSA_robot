@@ -9,9 +9,8 @@ sintetizado — que toca direto no speaker HDMI da Jetson (mesmo sink pinado
 que ja usamos pro say/spotifyd; nao depende do sink padrao do PulseAudio,
 que ja vimos resetar sozinho nessa Jetson).
 
-Mesmo padrao de LeitorProfundidade/OuvinteVAD (thread daemon + lock +
-getter) pra Camera_Simples.py poder desenhar a conversa na tela sem
-bloquear o video.
+Mesmo padrao de OuvinteVAD (thread daemon + lock + getter) pra
+Camera_Simples.py poder desenhar a conversa na tela sem bloquear o video.
 
 Compatibilidade: Python 3.6 da Jetson (sem "from __future__ import
 annotations", sem "X | None").

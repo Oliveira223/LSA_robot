@@ -17,6 +17,7 @@ Uso (a partir de src/):
     python3 -m jetson.mic_vad     # so escuta e imprime quando uma frase comeca/termina
 """
 
+import array
 import audioop
 import io
 import queue
@@ -24,6 +25,7 @@ import subprocess
 import threading
 import time
 import wave
+from collections import deque
 from typing import Optional
 
 TAXA = 48000
@@ -36,6 +38,8 @@ SILENCIO_S = 0.8          # silencio continuo por isso pra fechar a frase
 PRE_ROLL_S = 0.3          # comeco preservado antes do limiar disparar
 MAX_FALA_S = 20.0         # teto de seguranca — fecha a frase mesmo sem silencio
 CHUNK_S = 0.05            # granularidade de leitura/deteccao (~50 ms)
+HISTORICO_AUDIO_S = 2.0   # quanto de audio cru fica disponivel pra HUD (forma de onda)
+N_CHUNKS_HISTORICO = max(1, int(HISTORICO_AUDIO_S / CHUNK_S))
 
 CARD_FALLBACK = "2"
 SOURCE_FALLBACK = "alsa_input.usb-PrimeSense_PrimeSense_Device-01.analog-stereo"
@@ -124,6 +128,7 @@ class OuvinteVAD:
         self._nivel_atual = 0
         self._gravando_atual = False
         self._vivo = True   # False quando desiste de religar o arecord (vira "MIC OFFLINE" na HUD)
+        self._historico_audio = deque(maxlen=N_CHUNKS_HISTORICO)  # amostras cruas p/ forma de onda
 
         try:
             self._proc = self._abrir_arecord()
@@ -149,6 +154,18 @@ class OuvinteVAD:
         e so silencio."""
         with self._estado_lock:
             return self._nivel_atual, self._limiar, self._gravando_atual, self._vivo
+
+    def amostras_recentes(self):
+        """Ultimos ~HISTORICO_AUDIO_S segundos de audio cru (mono, int16),
+        mais recente no final — pra desenhar uma forma de onda de verdade
+        (picos reais, nao so o RMS agregado) na HUD da camera. Devolve um
+        array.array('h'), vazio se ainda nao capturou nada."""
+        with self._estado_lock:
+            pedacos = list(self._historico_audio)
+        amostras = array.array("h")
+        for pedaco in pedacos:
+            amostras.extend(pedaco)
+        return amostras
 
     def _loop(self):
         pre_roll = []
@@ -189,9 +206,12 @@ class OuvinteVAD:
                 continue
             reconexoes = 0
             nivel = audioop.rms(pedaco, LARGURA)
+            mono = array.array("h")
+            mono.frombytes(audioop.tomono(pedaco, LARGURA, 0.5, 0.5))
             with self._estado_lock:
                 self._nivel_atual = nivel
                 self._gravando_atual = gravando
+                self._historico_audio.append(mono)
 
             if not gravando:
                 pre_roll.append(pedaco)

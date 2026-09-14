@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Visualização simples da câmera PrimeSense: imagem RGB em tela cheia, com a
-profundidade (colorizada) em miniatura num canto, e um bounding box verde
-ao redor de rostos detectados (YOLOv3-face) na imagem RGB. Sem sidebar, sem
-outros modos — só isso.
+Visualização simples da câmera PrimeSense: imagem RGB em tela cheia, com um
+gráfico animado do nível do microfone (estilo onda de assistente de voz) em
+miniatura num canto, e um bounding box verde ao redor de rostos detectados
+(YOLOv3-face) na imagem RGB. Sem sidebar, sem outros modos — só isso.
 
 Uso:
     python3 Camera_Simples.py [--corner tl|tr|bl|br] [--windowed]
@@ -30,7 +30,6 @@ import os
 import signal
 import subprocess
 import sys
-import threading
 import time
 
 import cv2
@@ -194,29 +193,25 @@ def localizar_openni2_redist():
 
 
 # ─── Sensor ─────────────────────────────────────────────────────────────
-def iniciar_sensor(usar_profundidade=True):
-    """`usar_profundidade=False` nem cria o stream de profundidade — a
-    leitura+colorizacao (inpaint, Canny, normalizacao por percentil) tem um
-    custo de CPU real por frame, fora do fato de ser a parte mais instavel
-    do sensor nessa Jetson (trava/precisa de replug com frequencia). Quem
-    so quer RGB+rosto fica livre desse custo e dessa instabilidade."""
+def iniciar_sensor():
+    """So abre o stream de cor. O stream de profundidade nao e mais usado
+    (a miniatura do canto agora e o grafico de som, nao a profundidade) —
+    fora de nao servir mais pra nada aqui, era a parte mais pesada de CPU
+    (inpaint, Canny, normalizacao por percentil a cada frame) e mais
+    instavel do sensor nessa Jetson (trava/precisa de replug com
+    frequencia)."""
     openni2.initialize(localizar_openni2_redist())
     dev = openni2.Device.open_any()
     color_stream = dev.create_color_stream()
     color_stream.start()
-    depth_stream = None
-    if usar_profundidade:
-        depth_stream = dev.create_depth_stream()
-        depth_stream.start()
-    return dev, color_stream, depth_stream
+    return dev, color_stream
 
 
-def parar_sensor(color_stream, depth_stream):
-    for s in (color_stream, depth_stream):
-        try:
-            s.stop()
-        except Exception:
-            pass
+def parar_sensor(color_stream):
+    try:
+        color_stream.stop()
+    except Exception:
+        pass
     try:
         openni2.unload()
     except Exception:
@@ -231,98 +226,94 @@ def ler_color(color_stream):
     return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
 
-def ler_depth_colorido(depth_stream, colormap=cv2.COLORMAP_PLASMA):
-    """Colorizacao com apelo visual/HUD (proposital, nao fidelidade metrica):
-    normaliza por percentil (em vez de min/max puro) pra nao estourar o
-    frame inteiro numa unica mancha quando ha poucos pixels validos (vidro,
-    reflexo), e desenha um contorno tipo wireframe + linha de scan por cima
-    pra dar uma cara mais "sci-fi" de visao robotica."""
-    frame = depth_stream.read_frame()
-    img = np.frombuffer(frame.get_buffer_as_uint16(), dtype=np.uint16)
-    img = img.reshape(frame.height, frame.width)
-    buracos = (img == 0).astype(np.uint8)  # pixels sem leitura
-
-    validos = img[img > 0]
-    lo, hi = np.percentile(validos, [2, 98]) if validos.size else (0, 1)
-    if hi <= lo:
-        hi = lo + 1
-    img8 = np.clip((img.astype(np.float32) - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8)
-    img8 = cv2.inpaint(img8, buracos, 3, cv2.INPAINT_TELEA)
-
-    colorido = cv2.applyColorMap(img8, colormap)
-
-    # contorno tipo wireframe por cima (glow branco nas bordas de profundidade)
-    bordas = cv2.dilate(cv2.Canny(img8, 40, 120), None, iterations=1)
-    colorido[bordas > 0] = (255, 255, 255)
-
-    # grade fina tipo HUD, bem sutil
-    h, w = colorido.shape[:2]
-    grade = colorido.copy()
-    passo = 24
-    for x in range(0, w, passo):
-        cv2.line(grade, (x, 0), (x, h), (255, 255, 255), 1, cv2.LINE_AA)
-    for y in range(0, h, passo):
-        cv2.line(grade, (0, y), (w, y), (255, 255, 255), 1, cv2.LINE_AA)
-    colorido = cv2.addWeighted(grade, 0.06, colorido, 0.94, 0)
-
-    # linha de "scan" varrendo de cima a baixo, sincronizada pelo relogio
-    y_scan = int(((time.time() % 3.0) / 3.0) * h)
-    cv2.line(colorido, (0, y_scan), (w, y_scan), (255, 255, 255), 2, cv2.LINE_AA)
-
-    return colorido
-
-
-class LeitorProfundidade:
-    """Le e coloriza a profundidade numa thread separada. Na pratica
-    depth_stream.read_frame() as vezes trava/demora varios segundos nessa
-    Jetson (visto e confirmado 2026-09-11) — rodando numa thread a parte, um
-    engasgo na profundidade so deixa a miniatura desatualizada, sem travar o
-    video principal (cor + rosto)."""
-
-    def __init__(self, depth_stream):
-        self._depth_stream = depth_stream
-        self._lock = threading.Lock()
-        self._ultimo = np.zeros((240, 320, 3), dtype=np.uint8)  # placeholder ate a 1a leitura
-        self._rodando = True
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-
-    def ultimo_frame(self):
-        with self._lock:
-            return self._ultimo
-
-    def parar(self):
-        self._rodando = False
-        self._thread.join(timeout=2)
-
-    def _loop(self):
-        while self._rodando:
-            try:
-                prof = ler_depth_colorido(self._depth_stream)
-            except Exception:
-                time.sleep(0.2)  # evita spin de CPU quando a leitura falha
-                continue
-            with self._lock:
-                self._ultimo = prof
-
-
 # ─── Composição da tela ─────────────────────────────────────────────────
-def compor_picture_in_picture(fundo, mini, canto="br", margem=20, escala=0.28,
-                               rotulo="DEPTH SCAN"):
-    """Cola `mini` (a profundidade) pequena num canto de `fundo` (a cor,
-    já no tamanho da tela), com moldura estilo HUD (cantos tipo mira +
-    rótulo) em vez de uma borda simples."""
+def _texto_com_contorno(img, texto, pos, escala, cor):
+    """cv2.putText com um contorno preto por baixo, pra ficar legivel mesmo
+    quando a onda de som (ou qualquer outra coisa clara) passa atras."""
+    cv2.putText(img, texto, pos, cv2.FONT_HERSHEY_SIMPLEX, escala,
+                (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(img, texto, pos, cv2.FONT_HERSHEY_SIMPLEX, escala,
+                cor, 1, cv2.LINE_AA)
+
+
+class VisualizadorSom:
+    """Forma de onda "de verdade" do microfone — picos de amplitude reais,
+    nao uma senoide sintetica — com fundo TRANSPARENTE: desenha direto em
+    cima do recorte da imagem da camera (so escurecido um pouco, pra dar
+    contraste), entao o video continua aparecendo atras da onda. Estilo
+    HUD/terminal de filme de hacker, nao um mini-monitor a parte.
+
+    Le jetson.mic_vad.OuvinteVAD.amostras_recentes() (audio cru, mono,
+    int16) e desenha o min/max de cada faixa de amostras como uma barra
+    vertical — a mesma tecnica que editores de audio usam pra plotar forma
+    de onda, entao os picos vem do audio de verdade."""
+
+    COR_HUD = (255, 220, 0)      # ciano, mesma paleta dos outros paineis
+    COR_FALA = (0, 255, 80)      # verde quando acima do limiar (falando)
+    COR_OFFLINE = (0, 0, 255)    # vermelho — parou de verdade, nao e so silencio
+    TINT = 0.15                  # quanto escurece o video por baixo (0 = 100% transparente)
+
+    def desenhar(self, regiao, ouvinte):
+        """Desenha em cima de `regiao` (recorte do frame da camera, ja do
+        tamanho do painel) e devolve o resultado — nao cria fundo proprio."""
+        preto = np.zeros_like(regiao)
+        regiao = cv2.addWeighted(regiao, 1.0 - self.TINT, preto, self.TINT, 0)
+        altura, largura = regiao.shape[:2]
+        meio_y = altura // 2
+
+        if ouvinte is None:
+            return regiao
+
+        nivel, limiar, gravando, vivo = ouvinte.estado()
+        if not vivo:
+            cv2.line(regiao, (0, meio_y), (largura, meio_y), self.COR_OFFLINE, 1, cv2.LINE_AA)
+            _texto_com_contorno(regiao, "MIC OFFLINE", (largura // 2 - 78, meio_y - 10),
+                                 0.5, self.COR_OFFLINE)
+            return regiao
+
+        cor_onda = self.COR_FALA if gravando else self.COR_HUD
+        amostras = ouvinte.amostras_recentes()
+        if len(amostras) < 2:
+            cv2.line(regiao, (0, meio_y), (largura, meio_y), cor_onda, 1, cv2.LINE_AA)
+            return regiao
+
+        dados = np.frombuffer(amostras, dtype=np.int16).astype(np.float32)
+        bucket = max(1, len(dados) // largura)
+        usavel = (len(dados) // bucket) * bucket
+        dados = dados[-usavel:].reshape(-1, bucket)
+        minimos = dados.min(axis=1)
+        maximos = dados.max(axis=1)
+
+        # teto de amplitude derivado do limiar de fala (RMS) — voz normal
+        # ocupa boa parte da altura do painel sem estourar toda hora
+        teto = max(limiar * 6, 3000)
+        n_colunas = len(minimos)
+        for i in range(n_colunas):
+            x = int(i * largura / n_colunas)
+            y_topo = meio_y - int(np.clip(maximos[i] / teto, -1, 1) * (altura * 0.48))
+            y_base = meio_y - int(np.clip(minimos[i] / teto, -1, 1) * (altura * 0.48))
+            if y_topo == y_base:  # garante pelo menos 1px visivel mesmo em silencio total
+                y_base += 1
+            cv2.line(regiao, (x, y_topo), (x, y_base), cor_onda, 1, cv2.LINE_AA)
+
+        estado_txt = "OUVINDO..." if gravando else "MIC"
+        _texto_com_contorno(regiao, estado_txt, (8, 18), 0.45, cor_onda)
+
+        return regiao
+
+
+def compor_hud_transparente(fundo, visualizador, ouvinte, canto="br", margem=20,
+                             escala=0.28, proporcao=0.6, rotulo="AUDIO WAVE"):
+    """Desenha o painel de `visualizador` direto em cima do video (recorte
+    de `fundo`) em vez de colar uma miniatura opaca — o video continua
+    aparecendo atras da onda (so um pouco escurecido, ver
+    VisualizadorSom.TINT), com a mesma moldura HUD (cantos tipo mira +
+    rotulo) dos outros paineis."""
     cor_hud = (255, 220, 0)  # ciano tipo HUD, em BGR
 
     h, w = fundo.shape[:2]
     mw = int(w * escala)
-    mh = int(mini.shape[0] * (mw / mini.shape[1]))
-    mini = cv2.resize(mini, (mw, mh), interpolation=cv2.INTER_AREA)
-
-    borda = 2
-    mini = cv2.copyMakeBorder(mini, borda, borda, borda, borda,
-                               cv2.BORDER_CONSTANT, value=cor_hud)
-    mh, mw = mini.shape[:2]
+    mh = int(mw * proporcao)
 
     if canto == "tl":
         x, y = margem, margem
@@ -333,10 +324,10 @@ def compor_picture_in_picture(fundo, mini, canto="br", margem=20, escala=0.28,
     else:  # "br"
         x, y = w - mw - margem, h - mh - margem
 
-    saida = fundo.copy()
-    saida[y:y + mh, x:x + mw] = mini
+    saida = fundo
+    regiao = saida[y:y + mh, x:x + mw]
+    saida[y:y + mh, x:x + mw] = visualizador.desenhar(regiao, ouvinte)
 
-    # cantos tipo mira/HUD nos 4 vertices da miniatura
     tick = 14
     for (cx, cy, dx, dy) in [(x, y, 1, 1), (x + mw, y, -1, 1),
                               (x, y + mh, 1, -1), (x + mw, y + mh, -1, -1)]:
@@ -345,58 +336,6 @@ def compor_picture_in_picture(fundo, mini, canto="br", margem=20, escala=0.28,
 
     cv2.putText(saida, rotulo, (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                 cor_hud, 1, cv2.LINE_AA)
-
-    return saida
-
-
-def desenhar_mic_hud(fundo, ouvinte, x=20, y=None, largura=260, altura=14):
-    """Medidor de nivel do microfone (RMS atual vs limiar de fala), estilo
-    HUD, canto inferior esquerdo. `ouvinte` e um jetson.mic_vad.OuvinteVAD
-    (ou None — nesse caso nao desenha nada)."""
-    if ouvinte is None:
-        return fundo
-
-    cor_hud = (255, 220, 0)      # ciano, mesma paleta dos outros paineis
-    cor_fala = (0, 255, 80)      # verde quando acima do limiar (falando)
-    cor_offline = (0, 0, 255)    # vermelho — parou de verdade, nao e so silencio
-
-    nivel, limiar, gravando, vivo = ouvinte.estado()
-    h, w = fundo.shape[:2]
-    if y is None:
-        y = h - altura - 20
-
-    saida = fundo
-    # fundo semi-transparente atras da barra, pra legibilidade
-    faixa = saida[y - 18:y + altura + 4, x - 6:x + largura + 6].copy()
-    cv2.rectangle(faixa, (0, 0), (faixa.shape[1], faixa.shape[0]), (0, 0, 0), -1)
-    saida[y - 18:y + altura + 4, x - 6:x + largura + 6] = cv2.addWeighted(
-        faixa, 0.45, saida[y - 18:y + altura + 4, x - 6:x + largura + 6], 0.55, 0)
-
-    if not vivo:
-        cv2.rectangle(saida, (x, y), (x + largura, y + altura), cor_offline, 1, cv2.LINE_AA)
-        cv2.putText(saida, "MIC OFFLINE", (x, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                    cor_offline, 1, cv2.LINE_AA)
-        return saida
-
-    cv2.rectangle(saida, (x, y), (x + largura, y + altura), cor_hud, 1, cv2.LINE_AA)
-
-    # escala nao-linear (raiz) pra RMS baixo nao ficar ilegivel espremido
-    teto = max(limiar * 3, 1500)
-    frac = min((nivel / teto) ** 0.5, 1.0) if teto else 0.0
-    cor_barra = cor_fala if gravando else cor_hud
-    if frac > 0:
-        cv2.rectangle(saida, (x + 1, y + 1),
-                      (x + 1 + int(frac * (largura - 2)), y + altura - 1),
-                      cor_barra, -1)
-
-    # marca a posicao do limiar na barra
-    frac_limiar = min((limiar / teto) ** 0.5, 1.0) if teto else 0.0
-    xl = x + int(frac_limiar * (largura - 2))
-    cv2.line(saida, (xl, y - 3), (xl, y + altura + 3), (0, 0, 255), 1, cv2.LINE_AA)
-
-    estado_txt = "OUVINDO..." if gravando else "MIC"
-    cv2.putText(saida, estado_txt, (x, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                cor_barra, 1, cv2.LINE_AA)
 
     return saida
 
@@ -516,7 +455,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--corner", choices=["tl", "tr", "bl", "br"], default="br",
-                     help="canto onde a profundidade aparece (padrão: br)")
+                     help="canto onde o grafico de som aparece (padrão: br)")
     ap.add_argument("--windowed", action="store_true",
                      help="abre em janela normal em vez de tela cheia")
     ap.add_argument("--no-faces", action="store_true",
@@ -526,11 +465,8 @@ def main():
                      help="entrada da rede YOLO em pixels (padrao 160; menor = mais rapido)")
     ap.add_argument("--face-conf", type=float, default=0.5,
                      help="confianca minima da deteccao de rosto (padrao 0.5)")
-    ap.add_argument("--no-depth", action="store_true",
-                     help="desliga o stream de profundidade (nem abre o sensor de profundidade "
-                          "— e a parte mais pesada/instavel; so RGB+rosto)")
     ap.add_argument("--no-mic", action="store_true",
-                     help="desliga o indicador de nivel do microfone")
+                     help="desliga o grafico de nivel do microfone")
     ap.add_argument("--mic-limiar", type=int, default=None,
                      help="limiar de RMS pra considerar 'falando' (ajuste fino do VAD)")
     ap.add_argument("--no-chat", action="store_true",
@@ -550,14 +486,14 @@ def main():
             print(f"AVISO: modelo YOLO de rosto nao encontrado ({FACE_CFG} / "
                   f"{FACE_WEIGHTS}); seguindo sem deteccao de rosto.", file=sys.stderr)
 
-    # OpenNI2 abre a interface de video/profundidade da PrimeSense PRIMEIRO,
-    # sem nada mais mexendo no mesmo dispositivo USB ao mesmo tempo — visto
-    # na pratica 2026-09-14 que abrir o mic (arecord -l + Popen) concorrente
-    # com o Device.open_any() do OpenNI2 deixa a interface de audio travada
+    # OpenNI2 abre a interface de video da PrimeSense PRIMEIRO, sem nada mais
+    # mexendo no mesmo dispositivo USB ao mesmo tempo — visto na pratica
+    # 2026-09-14 que abrir o mic (arecord -l + Popen) concorrente com o
+    # Device.open_any() do OpenNI2 deixa a interface de audio travada
     # (arecord -l trava mesmo, precisa de replug fisico pra voltar). So
     # inicializa o mic/chat DEPOIS do sensor de video estar de pe.
-    _dev, color_stream, depth_stream = iniciar_sensor(usar_profundidade=not args.no_depth)
-    leitor_profundidade = LeitorProfundidade(depth_stream) if depth_stream else None
+    _dev, color_stream = iniciar_sensor()
+    visual_som = VisualizadorSom()
 
     ouvinte = None
     if not args.no_mic and OuvinteVAD is not None:
@@ -605,10 +541,8 @@ def main():
                 desenhar_rostos(cor, detector.boxes())
 
             quadro = cor
-            if leitor_profundidade:
-                profundidade = leitor_profundidade.ultimo_frame()
-                quadro = compor_picture_in_picture(quadro, profundidade, canto=args.corner)
-            quadro = desenhar_mic_hud(quadro, ouvinte)
+            if ouvinte is not None:
+                quadro = compor_hud_transparente(quadro, visual_som, ouvinte, canto=args.corner)
             if cliente_chat:
                 quadro = desenhar_chat(quadro, cliente_chat.mensagens())
             cv2.imshow(janela, quadro)
@@ -629,9 +563,7 @@ def main():
             cliente_chat.parar()
         if ouvinte:
             ouvinte.parar()
-        if leitor_profundidade:
-            leitor_profundidade.parar()
-        parar_sensor(color_stream, depth_stream)
+        parar_sensor(color_stream)
         cv2.destroyAllWindows()
 
 
