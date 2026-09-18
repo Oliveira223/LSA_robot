@@ -19,6 +19,7 @@ import socket
 import sys
 
 from common.protocol import recv_msg, send_texto
+from common.tcp_server import servir
 
 
 def processar(texto: str) -> str:
@@ -44,25 +45,7 @@ def atender(conexao: socket.socket) -> None:
 def main() -> None:
     host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
     porta = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
-
-    servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # Permite reabrir a porta logo apos fechar o servidor, sem esperar o TIME_WAIT.
-    servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    servidor.bind((host, porta))
-    servidor.listen(1)
-    print(f"[servidor] escutando em {host}:{porta} (Ctrl-C para sair)")
-
-    try:
-        while True:
-            conexao, endereco = servidor.accept()
-            print(f"[servidor] cliente conectado: {endereco[0]}:{endereco[1]}")
-            with conexao:
-                atender(conexao)
-            print("[servidor] aguardando novo cliente...")
-    except KeyboardInterrupt:
-        print("\n[servidor] encerrando")
-    finally:
-        servidor.close()
+    servir(host, porta, atender)
 
 
 if __name__ == "__main__":

@@ -43,6 +43,8 @@ N_CHUNKS_HISTORICO = max(1, int(HISTORICO_AUDIO_S / CHUNK_S))
 
 CARD_FALLBACK = "2"
 SOURCE_FALLBACK = "alsa_input.usb-PrimeSense_PrimeSense_Device-01.analog-stereo"
+NOME_DISPOSITIVO_PADRAO = "PrimeSense"
+NUMIDS_GANHO_PADRAO = ("4", "5")  # controles de ganho de captura da PrimeSense
 
 
 class ErroDeMic(Exception):
@@ -66,31 +68,34 @@ def _rodar(cmd):
         return None
 
 
-def _achar_card():
+def _achar_card(nome_dispositivo=NOME_DISPOSITIVO_PADRAO, fallback=CARD_FALLBACK):
     resultado = _rodar(["arecord", "-l"])
     if resultado is None:
-        return CARD_FALLBACK
+        return fallback
     saida = resultado.stdout.decode("utf-8", "replace")
     for linha in saida.splitlines():
-        if linha.startswith("card ") and "PrimeSense" in linha:
+        if linha.startswith("card ") and nome_dispositivo in linha:
             # "card 2: Device [USB Device 0x1d27:0x601], device 0: ..."
             return linha.split()[1].rstrip(":")
-    return CARD_FALLBACK
+    return fallback
 
 
-def _achar_source():
+def _achar_source(nome_dispositivo=NOME_DISPOSITIVO_PADRAO, fallback=None):
+    """`fallback=None` (padrao pra dispositivo desconhecido, ex.: Kinect) faz
+    devolver None em vez de arriscar suspender a fonte de OUTRO dispositivo
+    por engano — quem chama deve pular o suspend-source nesse caso."""
     resultado = _rodar(["pactl", "list", "short", "sources"])
     if resultado is None:
-        return SOURCE_FALLBACK
+        return fallback
     saida = resultado.stdout.decode("utf-8", "replace")
     for linha in saida.splitlines():
-        if "PrimeSense" in linha and "input" in linha:
+        if nome_dispositivo in linha and "input" in linha:
             return linha.split()[1]
-    return SOURCE_FALLBACK
+    return fallback
 
 
-def _aplicar_ganho(card, ganho):
-    for numid in ("4", "5"):
+def _aplicar_ganho(card, ganho, numids=NUMIDS_GANHO_PADRAO):
+    for numid in numids:
         _rodar(["amixer", "-c", card, "cset", "numid=%s" % numid, str(ganho)])
 
 
@@ -108,16 +113,25 @@ class OuvinteVAD:
     BACKOFF_RECONEXAO_S = 0.5
 
     def __init__(self, limiar_fala=LIMIAR_FALA, silencio_s=SILENCIO_S,
-                 ganho=GANHO_PADRAO, device=None):
-        self._card = _achar_card()
-        self._source = _achar_source()
+                 ganho=GANHO_PADRAO, device=None,
+                 nome_dispositivo=NOME_DISPOSITIVO_PADRAO,
+                 card_fallback=CARD_FALLBACK, source_fallback=SOURCE_FALLBACK,
+                 numids_ganho=NUMIDS_GANHO_PADRAO):
+        # nome_dispositivo/fallbacks/numids_ganho existem pra reaproveitar essa
+        # classe com OUTRO sensor (ex.: jetson/kinect_mic.py) sem duplicar toda
+        # a logica de VAD/reconexao/buffer — so muda como acha a placa e como
+        # aplica o ganho. Os padroes preservam o comportamento original (PrimeSense).
+        self._card = _achar_card(nome_dispositivo, card_fallback)
+        self._source = _achar_source(nome_dispositivo, source_fallback)
         self._device = device or ("hw:%s,0" % self._card)
         self._limiar = limiar_fala
         self._silencio_s = silencio_s
         self._ganho = ganho
 
-        _aplicar_ganho(self._card, ganho)
-        _rodar(["pactl", "suspend-source", self._source, "1"])
+        if numids_ganho:
+            _aplicar_ganho(self._card, ganho, numids_ganho)
+        if self._source:
+            _rodar(["pactl", "suspend-source", self._source, "1"])
 
         n_amostras_chunk = int(TAXA * CHUNK_S)
         self._bytes_por_chunk = n_amostras_chunk * CANAIS * LARGURA
@@ -282,7 +296,8 @@ class OuvinteVAD:
             except Exception:
                 pass
         self._thread.join(timeout=2)
-        _rodar(["pactl", "suspend-source", self._source, "0"])
+        if self._source:
+            _rodar(["pactl", "suspend-source", self._source, "0"])
 
 
 if __name__ == "__main__":

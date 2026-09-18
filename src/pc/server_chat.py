@@ -35,6 +35,7 @@ import socket
 import sys
 
 from common.protocol import TEXTO, recv_msg, send_texto
+from common.tcp_server import servir
 from pc.cerebro import responder
 
 
@@ -59,25 +60,8 @@ def atender(conexao: socket.socket) -> None:
 def main() -> None:
     host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
     porta = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
-
-    servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    servidor.bind((host, porta))
-    servidor.listen(1)
-    print(f"[servidor] escutando em {host}:{porta} (Ctrl-C para sair)")
     print("[servidor] modo chat: espera voce digitar a resposta de cada mensagem")
-
-    try:
-        while True:
-            conexao, endereco = servidor.accept()
-            print(f"[servidor] cliente conectado: {endereco[0]}:{endereco[1]}")
-            with conexao:
-                atender(conexao)
-            print("[servidor] aguardando novo cliente...")
-    except KeyboardInterrupt:
-        print("\n[servidor] encerrando")
-    finally:
-        servidor.close()
+    servir(host, porta, atender)
 
 
 if __name__ == "__main__":

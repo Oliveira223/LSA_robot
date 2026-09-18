@@ -26,11 +26,11 @@ Uso (a partir de src/, na Jetson):
 """
 
 import os
-import socket
 import subprocess
 import sys
 
 from common.protocol import TEXTO, recv_msg, send_texto
+from common.tcp_server import servir
 
 SAY_BIN = os.path.expanduser("~/dev/LSA_robot/src/jetson/bin/say")
 
@@ -46,8 +46,7 @@ def falar(texto):
         print("[tts_server] falha ao chamar '%s': %s" % (SAY_BIN, e))
 
 
-def atender(conexao, endereco):
-    print("[tts_server] cliente conectado: %s:%d" % endereco)
+def atender(conexao):
     while True:
         try:
             msg = recv_msg(conexao)
@@ -74,23 +73,8 @@ def main():
     if not os.path.exists(SAY_BIN):
         print("[tts_server] AVISO: '%s' nao encontrado — a fala vai falhar." % SAY_BIN)
 
-    servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    servidor.bind((host, porta))
-    servidor.listen(1)
-    print("[tts_server] escutando em %s:%d (Ctrl-C para sair)" % (host, porta))
     print("[tts_server] fala com: %s -1 <texto>" % SAY_BIN)
-
-    try:
-        while True:
-            conexao, endereco = servidor.accept()
-            with conexao:
-                atender(conexao, endereco)
-            print("[tts_server] aguardando novo cliente...")
-    except KeyboardInterrupt:
-        print("\n[tts_server] encerrando")
-    finally:
-        servidor.close()
+    servir(host, porta, atender, prefixo="[tts_server]")
 
 
 if __name__ == "__main__":

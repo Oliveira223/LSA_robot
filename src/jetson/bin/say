@@ -80,27 +80,72 @@ fi
 
 # keepalive: mantem o audio HDMI "acordado" pra o monitor nao cortar a 1a
 # silaba entre as falas. Sobe uma vez e fica (desligue com: say-keepalive stop).
-if [ "${SAY_NO_KEEPALIVE:-0}" != 1 ] && [ -x "$HOME/dev/say-keepalive" ]; then
-    "$HOME/dev/say-keepalive" start >/dev/null 2>&1 || true
+if [ "${SAY_NO_KEEPALIVE:-0}" != 1 ]; then
+    keepalive_bin="$(command -v say-keepalive 2>/dev/null)"
+    [ -z "$keepalive_bin" ] && [ -x "$HOME/.local/bin/say-keepalive" ] \
+        && keepalive_bin="$HOME/.local/bin/say-keepalive"
+    [ -n "$keepalive_bin" ] && "$keepalive_bin" start >/dev/null 2>&1
 fi
 
-# toca um wav colando LEAD_MS de ruido baixo (LEAD_AMP) na frente, no mesmo
-# stream. Nao modifica o arquivo original.
+LEAD_RAW=""
+LEAD_RAW_SIZE=0
+
+# gera o buffer de lead-in (ruido baixo, mono 16-bit @ RATE_HZ) UMA vez por
+# sessao do "say", em vez de subir um python3 (com o modulo wave lendo e
+# reescrevendo o audio inteiro) a cada frase falada - no modo interativo isso
+# custava ~150-200ms extra por linha nesta placa.
+gen_lead_raw() {
+    local n out
+    n=$(( RATE_HZ * LEAD_MS / 1000 ))
+    out="$(mktemp)"
+    python3 -c "
+import struct, random, sys
+n, amp = $n, $LEAD_AMP
+buf = (struct.pack('<%dh' % n, *[random.randint(-amp, amp) for _ in range(n)])
+       if amp > 0 else b'\\x00' * (n * 2))
+sys.stdout.buffer.write(buf)
+" > "$out" 2>>"$LOG" || { rm -f "$out"; return 1; }
+    LEAD_RAW="$out"
+    LEAD_RAW_SIZE=$(stat -c%s "$out")
+}
+
+if [ "$LEAD_MS" -gt 0 ] 2>/dev/null; then
+    gen_lead_raw || echo "(aviso: lead-in desativado; veja $LOG)" >&2
+fi
+trap 'rm -f "$LEAD_RAW" 2>/dev/null' EXIT
+
+# imprime 4 bytes little-endian (uint32) de $1 direto no stdout
+le32() {
+    local n=$1 b1 b2 b3 b4
+    b1=$(printf '%02x' $((n & 255)))
+    b2=$(printf '%02x' $((n >> 8 & 255)))
+    b3=$(printf '%02x' $((n >> 16 & 255)))
+    b4=$(printf '%02x' $((n >> 24 & 255)))
+    printf "\\x$b1\\x$b2\\x$b3\\x$b4"
+}
+
+# toca um wav colando o lead-in ja pronto (LEAD_RAW) na frente, no mesmo
+# stream. So corrige os 2 campos de tamanho do cabecalho WAV (RIFF e data);
+# assume o cabecalho canonico de 44 bytes que o piper sempre gera (PCM mono
+# 16-bit, sem chunks extras). Nao modifica o arquivo original.
 play_with_lead() {
-    local w="$1" tmp="${1%.wav}.lead.wav"
-    if [ "$LEAD_MS" -gt 0 ] 2>/dev/null; then
-        python3 - "$w" "$tmp" "$LEAD_MS" "$LEAD_AMP" <<'PY' 2>>"$LOG" || tmp=""
-import wave, sys, struct, random
-src, dst, lead_ms, amp = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
-w = wave.open(src, 'rb')
-fr, ch, sw = w.getframerate(), w.getnchannels(), w.getsampwidth()
-data = w.readframes(w.getnframes()); w.close()
-n = int(fr * lead_ms / 1000) * ch
-lead = (struct.pack('<%dh' % n, *[random.randint(-amp, amp) for _ in range(n)])
-        if amp > 0 else b'\x00' * (n * 2))
-o = wave.open(dst, 'wb'); o.setnchannels(ch); o.setsampwidth(sw); o.setframerate(fr)
-o.writeframes(lead + data); o.close()
-PY
+    local w="$1" tmp="${1%.wav}.lead.wav" sz data_sz riff_sz
+    if [ -n "$LEAD_RAW" ] && [ -s "$LEAD_RAW" ]; then
+        sz=$(stat -c%s "$w" 2>/dev/null || echo 0)
+        if [ "$sz" -gt 44 ] 2>/dev/null; then
+            data_sz=$((sz - 44 + LEAD_RAW_SIZE))
+            riff_sz=$((data_sz + 36))
+            {
+                dd if="$w" bs=1 count=4 status=none         # "RIFF"
+                le32 "$riff_sz"
+                dd if="$w" bs=1 skip=8 count=32 status=none # "WAVEfmt ...data"
+                le32 "$data_sz"
+                cat "$LEAD_RAW"
+                tail -c +45 "$w"                             # audio original
+            } > "$tmp" 2>>"$LOG" || tmp=""
+        else
+            tmp=""
+        fi
     else
         tmp=""
     fi
@@ -119,6 +164,10 @@ if [ -n "$save" ]; then
     fi
     printf '%s\n' "${phrase[*]}" | "$PIPER_DIR/piper" -m "$model" \
         --espeak_data "$ESPEAK_DATA" --length_scale "$length" -f "$save" 2>>"$LOG"
+    if [ ! -s "$save" ]; then
+        echo "ERRO: piper falhou ao gerar $save; veja $LOG" >&2
+        exit 1
+    fi
     play_with_lead "$save"          # nao altera $save; toca uma copia com lead-in
     exit $?
 fi
@@ -138,6 +187,7 @@ start_engine() {
 }
 
 cleanup() {
+    rm -f "$LEAD_RAW" 2>/dev/null
     [ -n "$engine_pid" ] || return 0
     exec 4>&- 2>/dev/null      # EOF -> piper sai
     wait "$engine_pid" 2>/dev/null
@@ -181,7 +231,8 @@ fi
 
 echo "Voz: $(basename "$model" .onnx | sed 's/^pt_BR-//')  |  length_scale=$length  |  'sair' ou Ctrl+D encerra"
 while IFS= read -r -p "> " line; do
-    case "$line" in sair|quit|exit) break ;; esac
+    cmd="$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    case "$cmd" in sair|quit|exit) break ;; esac
     say_line "$line"
 done
 echo

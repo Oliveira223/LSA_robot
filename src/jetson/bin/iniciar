@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# iniciar - menu interativo pra escolher o que ativar na tela da câmera
+# antes de abrir (rosto, mic real/simulado/nenhum, chat, fala interativa) e
+# já chamar o `camera-simples` com as flags certas, sempre em tela cheia —
+# sem precisar decorar nenhuma flag. Abre automaticamente ao fim das
+# perguntas. Lembra a última escolha (salva em
+# ~/.config/lsa-robot/iniciar.conf) — só apertar ENTER em tudo repete o que
+# rodou da última vez.
+#
+#   ./iniciar             abre o menu
+#
+# Feito porque abrir o app "do jeito certo" pra cada situação (mic
+# instável, demonstração pra visitante, testar rápido sem hardware) tava
+# virando um monte de flags pra lembrar de cabeça — ver README.md, seção
+# "Chat por voz ao vivo".
+set -u
+
+DIR_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ARQ_CONF="$HOME/.config/lsa-robot/iniciar.conf"
+
+# ── valores padrao (primeira vez, ou se o arquivo de config nao existir) ──
+CONF_ROSTO=n
+CONF_MIC=1             # 1=PrimeSense 2=simulado 3=nenhum
+CONF_CHAT=s
+CONF_CHAT_PORTA=5001
+CONF_ABRIR_SAY=n
+
+# shellcheck disable=SC1090
+[ -f "$ARQ_CONF" ] && . "$ARQ_CONF"
+
+pergunta_sim_nao() {
+    # pergunta_sim_nao "texto" "s"|"n" -> 0 (sim) ou 1 (nao); imprime nada
+    local texto="$1" padrao="$2" resp
+    local sufixo="[s/N]"
+    [ "$padrao" = "s" ] && sufixo="[S/n]"
+    read -r -p "$texto $sufixo " resp
+    resp="${resp:-$padrao}"
+    [[ "$resp" =~ ^[sSyY] ]]
+}
+
+pergunta_escolha() {
+    # pergunta_escolha "texto" indice_padrao "opcao1" "opcao2" ... -> imprime
+    # (via stdout) o indice (1-based) escolhido. ENTER vazio aceita o
+    # padrao; qualquer coisa que NAO seja um numero valido faz reperguntar
+    # em vez de cair silenciosamente no padrao (bug visto na pratica
+    # 2026-09-14: uma resposta invalida escolheu "simulado" sem querer).
+    local texto="$1" padrao="$2"; shift 2
+    local opcoes=("$@") i resp
+    echo "$texto" >&2
+    for i in "${!opcoes[@]}"; do
+        echo "  $((i + 1))) ${opcoes[$i]}" >&2
+    done
+    while true; do
+        printf "Escolha [padrao %s]: " "$padrao" >&2
+        read -r resp
+        if [ -z "$resp" ]; then
+            echo "$padrao"
+            return
+        fi
+        if [[ "$resp" =~ ^[0-9]+$ ]] && [ "$resp" -ge 1 ] && [ "$resp" -le "${#opcoes[@]}" ]; then
+            echo "$resp"
+            return
+        fi
+        echo "Opcao invalida — digite um numero de 1 a ${#opcoes[@]}, ou ENTER pro padrao." >&2
+    done
+}
+
+echo "=== Como abrir a câmera hoje? (sempre tela cheia) ==="
+echo "(ENTER em tudo repete a ultima configuracao usada)"
+echo
+
+echo "--- Detecção de rosto ---"
+if pergunta_sim_nao "Ativar detecção de rosto (YOLO — usa uma CPU inteira)?" "$CONF_ROSTO"; then
+    CONF_ROSTO=s
+    FLAG_ROSTO=()
+else
+    CONF_ROSTO=n
+    FLAG_ROSTO=(--no-faces)
+fi
+echo
+
+echo "--- Microfone / gráfico de onda ---"
+CONF_MIC="$(pergunta_escolha "Fonte do grafico de som:" "$CONF_MIC" \
+    "PrimeSense de verdade" \
+    "Simulado (sem hardware — so pra ficar bonito na tela)" \
+    "Nenhum (desliga o grafico)")"
+case "$CONF_MIC" in
+    1) FLAGS_MIC=() ;;
+    2) FLAGS_MIC=(--mic-mock) ;;
+    3) FLAGS_MIC=(--no-mic) ;;
+esac
+echo
+
+echo "--- Chat por voz com o notebook ---"
+echo "(o mic agora e do notebook — pc.voice_client; a Jetson so escuta e fala a"
+echo " resposta com o Piper. Independe da escolha de microfone acima.)"
+if pergunta_sim_nao "Ligar o painel de chat (espera o notebook conectar)?" "$CONF_CHAT"; then
+    CONF_CHAT=s
+    read -r -p "Porta pra escutar [$CONF_CHAT_PORTA]: " porta
+    CONF_CHAT_PORTA="${porta:-$CONF_CHAT_PORTA}"
+    FLAGS_CHAT=(--chat-port "$CONF_CHAT_PORTA")
+    echo "(depois, no notebook: python3 -m pc.voice_client <ip-desta-jetson> $CONF_CHAT_PORTA)"
+else
+    CONF_CHAT=n
+    FLAGS_CHAT=(--no-chat)
+fi
+echo
+
+echo "--- Fala interativa (say) ---"
+if pergunta_sim_nao "Depois de abrir a camera, deixar o 'say' aberto neste terminal (digitar e ele fala)?" "$CONF_ABRIR_SAY"; then
+    CONF_ABRIR_SAY=s
+else
+    CONF_ABRIR_SAY=n
+fi
+echo
+
+TODAS_FLAGS=("${FLAG_ROSTO[@]}" "${FLAGS_MIC[@]}" "${FLAGS_CHAT[@]}")
+
+echo "=== Abrindo ==="
+echo "camera-simples ${TODAS_FLAGS[*]}"
+[ "$CONF_ABRIR_SAY" = "s" ] && echo "(depois abre o 'say' interativo neste terminal)"
+echo
+
+mkdir -p "$(dirname "$ARQ_CONF")"
+cat > "$ARQ_CONF" <<EOF
+CONF_ROSTO=$CONF_ROSTO
+CONF_MIC=$CONF_MIC
+CONF_CHAT=$CONF_CHAT
+CONF_CHAT_PORTA=$CONF_CHAT_PORTA
+CONF_ABRIR_SAY=$CONF_ABRIR_SAY
+EOF
+
+"$DIR_BIN/camera-simples" "${TODAS_FLAGS[@]}"
+if [ "$CONF_ABRIR_SAY" = "s" ]; then
+    echo
+    echo "Abrindo 'say' (modo interativo — 'sair'/Ctrl+D encerra so o say, a camera continua rodando)"
+    SAY_BIN="$(command -v say || echo "$DIR_BIN/say")"
+    exec "$SAY_BIN"
+fi

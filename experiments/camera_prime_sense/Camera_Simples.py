@@ -28,7 +28,6 @@ import glob
 import multiprocessing as mp
 import os
 import signal
-import subprocess
 import sys
 import time
 
@@ -43,6 +42,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # repo-vs-app-rodando. Import defensivo: sem o mic, a camera continua
 # funcionando normalmente (mesmo espirito do detector de rosto ausente).
 sys.path.insert(0, os.path.expanduser("~/dev/LSA_robot/src"))
+from common.janela import tamanho_tela_cheia
 try:
     from jetson.mic_vad import OuvinteVAD, ErroDeMic
 except Exception as _erro_import_mic:
@@ -50,6 +50,12 @@ except Exception as _erro_import_mic:
     ErroDeMic = Exception
     print(f"AVISO: jetson.mic_vad indisponivel ({_erro_import_mic}); "
           "seguindo sem indicador de microfone.", file=sys.stderr)
+try:
+    from jetson.mic_mock import OuvinteMock
+except Exception as _erro_import_mock:
+    OuvinteMock = None
+    print(f"AVISO: jetson.mic_mock indisponivel ({_erro_import_mock}); "
+          "--mic-mock nao vai funcionar.", file=sys.stderr)
 try:
     from jetson.chat_client import ClienteChat, ErroDeChat
 except Exception as _erro_import_chat:
@@ -424,23 +430,6 @@ def desenhar_chat(fundo, mensagens, margem=20, altura_frac=0.5, largura_frac=0.3
     return saida
 
 
-# ─── Janela em tela cheia ───────────────────────────────────────────────
-def tamanho_tela_cheia():
-    """Resolução do monitor via xrandr; usa 1920x1080 se não conseguir."""
-    try:
-        saida = subprocess.check_output(
-            ["xrandr", "--current"], env=os.environ, timeout=3
-        ).decode()
-        for linha in saida.splitlines():
-            if "*" in linha:
-                modo = linha.split()[0]
-                w, h = modo.split("x")
-                return int(w), int(h)
-    except Exception:
-        pass
-    return 1920, 1080
-
-
 def _on_sigterm(signum, frame):
     # sem isso, um "kill" (SIGTERM) mata o processo na hora e pula o
     # 'finally' do main() — o OpenNI2/sensor da PrimeSense fica travado
@@ -458,6 +447,12 @@ def main():
                      help="canto onde o grafico de som aparece (padrão: br)")
     ap.add_argument("--windowed", action="store_true",
                      help="abre em janela normal em vez de tela cheia")
+    ap.add_argument("--vitrine", action="store_true",
+                     help="janela pequena num canto da tela (chama atencao sem ocupar "
+                          "a tela toda) em vez de tela cheia — ignora --windowed")
+    ap.add_argument("--vitrine-canto", choices=["tl", "tr", "bl", "br"], default="br",
+                     help="canto da TELA onde a janela --vitrine aparece (padrao: br; "
+                          "diferente de --corner, que e o canto do grafico DENTRO do video)")
     ap.add_argument("--no-faces", action="store_true",
                      help="desliga a deteccao de rosto (YOLOv3-face; roda em processo a parte, "
                           "~1 deteccao/seg, mas ainda consome uma CPU inteira)")
@@ -469,6 +464,11 @@ def main():
                      help="desliga o grafico de nivel do microfone")
     ap.add_argument("--mic-limiar", type=int, default=None,
                      help="limiar de RMS pra considerar 'falando' (ajuste fino do VAD)")
+    ap.add_argument("--mic-mock", action="store_true",
+                     help="grafico de onda com dados SIMULADOS (jetson.mic_mock), sem "
+                          "precisar de mic de verdade — util quando o hardware esta "
+                          "instavel mas ainda se quer mostrar o grafico bonito. Nunca "
+                          "manda audio pro chat (so visual). Ignora --mic-limiar/--no-mic")
     ap.add_argument("--no-chat", action="store_true",
                      help="desliga o chat por voz com o PC (so fica o indicador de mic)")
     ap.add_argument("--chat-host", default="127.0.0.1",
@@ -491,12 +491,24 @@ def main():
     # 2026-09-14 que abrir o mic (arecord -l + Popen) concorrente com o
     # Device.open_any() do OpenNI2 deixa a interface de audio travada
     # (arecord -l trava mesmo, precisa de replug fisico pra voltar). So
-    # inicializa o mic/chat DEPOIS do sensor de video estar de pe.
+    # inicializa o mic/chat DEPOIS do sensor de video estar de pe — e com
+    # uma pausa curta no meio: so sequenciar nao bastou na pratica (visto
+    # 2026-09-14 em varios testes seguidos: o mic falha quase toda vez que
+    # abre logo apos o video, mesmo sozinho — sem o video aberto junto —
+    # funciona sempre; parece precisar de um respiro no barramento USB
+    # depois que o stream de video comeca a transferir de verdade).
     _dev, color_stream = iniciar_sensor()
+    time.sleep(1.5)
     visual_som = VisualizadorSom()
 
     ouvinte = None
-    if not args.no_mic and OuvinteVAD is not None:
+    if args.mic_mock:
+        if OuvinteMock is not None:
+            ouvinte = OuvinteMock()
+        else:
+            print("AVISO: jetson.mic_mock indisponivel; seguindo sem indicador de mic.",
+                  file=sys.stderr)
+    elif not args.no_mic and OuvinteVAD is not None:
         try:
             kwargs = {"limiar_fala": args.mic_limiar} if args.mic_limiar else {}
             ouvinte = OuvinteVAD(**kwargs)
@@ -516,7 +528,12 @@ def main():
             except ErroDeChat as e:
                 print(f"AVISO: chat indisponivel ({e}); seguindo sem chat.", file=sys.stderr)
 
-    largura, altura = (960, 720) if args.windowed else tamanho_tela_cheia()
+    if args.vitrine:
+        largura, altura = 480, 270
+    elif args.windowed:
+        largura, altura = 960, 720
+    else:
+        largura, altura = tamanho_tela_cheia()
 
     janela = "PrimeSense"
     # sem isso, o backend GTK do highgui as vezes cria a janela mas nunca a
@@ -548,7 +565,18 @@ def main():
             cv2.imshow(janela, quadro)
 
             if primeiro_frame:
-                if not args.windowed:
+                if args.vitrine:
+                    tela_w, tela_h = tamanho_tela_cheia()
+                    if args.vitrine_canto == "tl":
+                        x, y = 0, 0
+                    elif args.vitrine_canto == "tr":
+                        x, y = tela_w - largura, 0
+                    elif args.vitrine_canto == "bl":
+                        x, y = 0, tela_h - altura
+                    else:  # "br"
+                        x, y = tela_w - largura, tela_h - altura
+                    cv2.moveWindow(janela, x, y)
+                elif not args.windowed:
                     cv2.setWindowProperty(janela, cv2.WND_PROP_FULLSCREEN,
                                            cv2.WINDOW_FULLSCREEN)
                 primeiro_frame = False

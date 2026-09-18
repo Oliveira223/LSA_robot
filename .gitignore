@@ -27,3 +27,4 @@ audio_temp/
 !**/fixtures/*.wav
 
 .claude/
+graphify-out/

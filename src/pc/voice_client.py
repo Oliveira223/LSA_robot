@@ -21,23 +21,11 @@ import socket
 import sys
 
 from common.audio_io import Cronometro, ErroDeAudioIO, Gravador
+from common.cli import ler as _ler, sair as _sair
 from common.protocol import recv_msg, send_texto
 from pc import stt
 from pc.cerebro import responder
 from pc.push_to_talk import preparar_audio
-
-
-def _ler(prompt: str) -> str | None:
-    """input() que devolve None em EOF/Ctrl-C em vez de estourar."""
-    try:
-        return input(prompt)
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return None
-
-
-def _sair(s: str | None) -> bool:
-    return s is None or s.strip().lower() in ("q", "sair", "quit", "exit")
 
 
 def _uma_rodada(sock: socket.socket, grav: Gravador) -> bool:

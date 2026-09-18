@@ -63,9 +63,17 @@ src/                  todo o código executável; rode a partir daqui, via pytho
     testar_microfone.py  diagnóstico de microfone
     mic_vad.py           escuta contínua com detecção de fala por volume (VAD) — usado pelo
                           chat por voz ao vivo e pelo gráfico de onda da câmera
+    mic_mock.py           mesma interface de mic_vad, dados SIMULADOS — mantém o gráfico de
+                           onda bonito sem depender de hardware (ver Camera_Simples --mic-mock)
     chat_client.py        conecta o mic da Jetson ao pc.server_voz; fala a resposta com Piper
     tts_server.py         servidor do caminho alternativo (mic do PC, porta 5001) — parado,
                            usado só se voice_client.py (acima) voltar a ser usado
+    kinect_camera.py      RGB+profundidade do Kinect (Xbox 360) via libfreenect/ctypes —
+                           caminho independente da PrimeSense, não integrado ao Camera_Simples.py
+    kinect_mic.py          mic do Kinect — bloqueado por firmware proprietário ausente (ver
+                            docstring do arquivo)
+    bin/iniciar            menu interativo: pergunta janela/rosto/mic/chat/say e já chama o
+                            camera-simples certo — lembra a última escolha, é o jeito fácil
     bin/camera-simples    atalho: mata processo antigo, reseta USB e reabre a tela da câmera
     bin/say, bin/voz       TTS local (Piper) — ver docs/roadmap-comunicacao.md
 experiments/
@@ -190,9 +198,21 @@ antes de rodar o `server-voz`.
 
 #### 2. Na Jetson, via SSH — câmera + chat
 
-Precisa do `DISPLAY`/`XAUTHORITY` da sessão gráfica que já está rodando na
-tela física (a janela não abre "dentro" do SSH) e do IP/hostname do
-notebook (pra Jetson saber pra onde mandar o áudio):
+**Jeito fácil — menu interativo, não precisa decorar flag nenhuma:**
+```bash
+ssh lsa-robot@<ip-da-jetson>
+iniciar
+```
+Pergunta janela (tela cheia / vitrine num canto / normal), rosto, fonte do
+gráfico de som (PrimeSense de verdade / simulado, sem depender de
+hardware / nenhum), chat (host/porta) e se quer o `say` interativo aberto
+no terminal depois — e chama o `camera-simples` certo no final. ENTER em
+tudo repete a última configuração usada.
+
+**Na mão, com as flags direto** (o que o `iniciar` roda por baixo dos
+panos) — precisa do `DISPLAY`/`XAUTHORITY` da sessão gráfica que já está
+rodando na tela física (a janela não abre "dentro" do SSH) e do
+IP/hostname do notebook:
 
 ```bash
 ssh lsa-robot@<ip-da-jetson>
@@ -213,9 +233,12 @@ Parâmetros úteis do `camera-simples` (repassados direto pro
 | `--chat-port <porta>` | porta do `pc.server_voz` (padrão 5000) |
 | `--no-chat` | só o indicador de mic, sem conectar no notebook |
 | `--no-mic` | desliga também o gráfico de onda do mic |
+| `--mic-mock` | gráfico de onda com dados SIMULADOS (sem depender do mic real) |
 | `--no-faces` | desliga a detecção de rosto (economiza CPU) |
-| `--corner tl\|tr\|bl\|br` | canto onde o gráfico de onda aparece |
+| `--corner tl\|tr\|bl\|br` | canto onde o gráfico de onda aparece DENTRO do vídeo |
 | `--windowed` | janela normal em vez de tela cheia (útil testando) |
+| `--vitrine` | janela pequena num canto da TELA (chama atenção sem ocupar tudo) |
+| `--vitrine-canto tl\|tr\|bl\|br` | canto da tela onde a `--vitrine` aparece |
 
 Outros comandos do `camera-simples`:
 ```bash

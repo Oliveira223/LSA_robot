@@ -30,6 +30,7 @@ import numpy as np
 import sounddevice as sd
 
 from common.audio_io import Cronometro, Gravador
+from common.cli import ler as _ler, sair as _sair
 from pc import stt
 
 
@@ -46,15 +47,6 @@ def preparar_audio(audio: np.ndarray) -> tuple[np.ndarray, float, float]:
         ganho = min(0.95 / pico, 30.0)   # teto evita amplificar só ruído
         audio = np.clip(audio * ganho, -1.0, 1.0)
     return audio, pico, ganho
-
-
-def _ler(prompt: str) -> str | None:
-    """input() que devolve None em EOF/Ctrl-C em vez de estourar."""
-    try:
-        return input(prompt)
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return None
 
 
 def _listar_entradas():
@@ -107,9 +99,6 @@ def main() -> None:
     with Gravador(indice) as grav:
         print(f"\nmic: {grav.nome} · {grav.taxa} Hz · modelo {stt.MODELO}")
         print("ENTER grava / para · q sai\n")
-
-        def _sair(s: str | None) -> bool:
-            return s is None or s.strip().lower() in ("q", "sair", "quit", "exit")
 
         while True:
             if _sair(_ler("▶ gravar > ")):
