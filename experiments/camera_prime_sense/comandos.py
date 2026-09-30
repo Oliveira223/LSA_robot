@@ -55,6 +55,9 @@ def registrar_comandos(servidor, args, saudador, mic, transcritor, conversa,
         if conversa is not None:
             linhas.append("cerebro (Jetson 1): " + ("conectado" if conversa.conectado()
                                                      else "desconectado"))
+        if conversa is not None and conversa.conectado():
+            linhas.append("voz: " + ("robo (Piper, Jetson 1)" if conversa.suporta_falar() else
+                          "local (voz robotica; o servidor da Jetson 1 esta desatualizado)"))
         linhas.append("saudacao: " + _estado_saudacao(saudador))
         return "\n".join(linhas)
 
@@ -151,9 +154,11 @@ def registrar_comandos(servidor, args, saudador, mic, transcritor, conversa,
         except ValueError:
             raise ValueError("uso: ouvir <seq>")
         if seq < 0:                            # primeira chamada: so ancora no "agora"
-            return json.dumps({"seq": transcritor.registro_desde(0)[0], "itens": [], "parcial": ""})
+            return json.dumps({"seq": transcritor.registro_desde(0)[0], "itens": [], "parcial": "",
+                               "aguardando": False})
         ultimo, itens, parcial = transcritor.registro_desde(seq)
-        return json.dumps({"seq": ultimo, "itens": itens, "parcial": parcial},
+        return json.dumps({"seq": ultimo, "itens": itens, "parcial": parcial,
+                           "aguardando": bool(conversa is not None and conversa.aguardando())},
                           ensure_ascii=False)
 
     servidor.registrar("status", cmd_status)

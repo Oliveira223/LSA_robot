@@ -632,6 +632,8 @@ def main():
                         disponivel=saudavel)
     if transcritor is not None:
         transcritor.definir_mudo_extra(saudador.falando)
+    if conversa is not None:
+        saudador.definir_voz_cerebro(conversa.falar_literal)   # mesma voz das respostas
 
     mic = types.SimpleNamespace(ouvinte=ouvinte)   # o `reiniciar mic` troca o ouvinte aqui
     pode_reiniciar_mic = OuvinteVAD is not None and not args.no_mic and not args.mic_mock

@@ -11,7 +11,11 @@ app. Evita falar repetido:
   - depois de falar, espera `intervalo_s` antes de saudar de novo;
   - nao fala por cima de si mesmo.
 
-Motor de voz (o primeiro que existir):
+Motor de voz (o primeiro que funcionar):
+  0. a voz do robo: a Jetson 1 sintetiza com o Piper (a mesma voz das respostas
+     do cerebro) e esta Jetson toca — ver ClienteConversa.falar_literal. Exige o
+     servidor_conversa.py novo na Jetson 1; se ela estiver fora do ar ou com o
+     servidor antigo, cai pra um dos abaixo e avisa;
   1. jetson/bin/say  — Piper, se ~/piper/piper estiver instalado nesta Jetson;
   2. audio/bom_dia.wav (ao lado deste arquivo), tocado com paplay — gere na
      Jetson 1 com `say -o bom_dia.wav "Bom dia"` e copie pra ca. So vale pra
@@ -54,6 +58,13 @@ class Saudador:
         self._mudo_ate = 0.0
         self._ocupado = False
         self._lock = threading.Lock()
+        self._voz_cerebro = None      # funcao(texto) -> (ok, msg), ver definir_voz_cerebro
+        self._cerebro_ruim_ate = 0.0  # depois de uma falha, nao insiste por um tempo
+
+    def definir_voz_cerebro(self, funcao):
+        """funcao(texto) -> (ok, mensagem): fala com a voz do robo via Jetson 1
+        (ClienteConversa.falar_literal). Sem ela, usa so os motores locais."""
+        self._voz_cerebro = funcao
 
     def falando(self):
         return self._ocupado or time.time() < self._mudo_ate
@@ -95,25 +106,37 @@ class Saudador:
             if self._ocupado:
                 return "ja estou falando; tente de novo em instantes"
             self._ocupado = True
+        aviso = ""
         try:
+            if self._voz_cerebro is not None and time.time() >= self._cerebro_ruim_ate:
+                ok, msg = self._voz_cerebro(texto)
+                if ok:
+                    print("[saudacao] falando %r (%s)" % (texto, msg), flush=True)
+                    return "falei %r (%s)" % (texto, msg)
+                self._cerebro_ruim_ate = time.time() + 30.0     # evita esperar timeout a cada fala
+                aviso = " [voz do robo indisponivel: %s]" % msg
+                print("[saudacao] voz do robo indisponivel: %s" % msg, flush=True)
             nome, argv, env = self._comando(texto)
             print("[saudacao] falando %r (%s)" % (texto, nome), flush=True)
-            r = subprocess.run(argv, env=env, timeout=30,
+            r = subprocess.run(argv, env=env, timeout=30, stdin=subprocess.DEVNULL,
+                               start_new_session=True,
                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             if (r.returncode != 0 and nome == "spd-say"
                     and b"Speech Dispatcher" in r.stderr):
                 # o daemon nao estava de pe e o autospawn do spd-say falha sem
                 # terminal (visto no app aberto pelo launcher): sobe na mao e repete
                 subprocess.run(["speech-dispatcher", "--spawn"], env=env, timeout=15,
+                               stdin=subprocess.DEVNULL, start_new_session=True,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 time.sleep(1.0)
-                r = subprocess.run(argv, env=env, timeout=30,
+                r = subprocess.run(argv, env=env, timeout=30, stdin=subprocess.DEVNULL,
+                                   start_new_session=True,
                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             if r.returncode != 0:
                 erro = r.stderr.decode(errors="replace").strip()[:300]
                 print("[saudacao] %s falhou (rc=%d): %s" % (nome, r.returncode, erro), flush=True)
-                return "%s falhou (rc=%d): %s" % (nome, r.returncode, erro)
-            return "falei %r (%s)" % (texto, nome)
+                return "%s falhou (rc=%d): %s%s" % (nome, r.returncode, erro, aviso)
+            return "falei %r (%s)%s" % (texto, nome, aviso)
         except (OSError, subprocess.SubprocessError) as e:
             print("[saudacao] falha ao falar: %s" % e, flush=True)
             return "falha ao falar: %s" % e
