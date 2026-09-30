@@ -20,6 +20,13 @@ Permite alternar entre os sensores de profundidade, infravermelho e cor, exibir 
 
 ---
 
+## Detecção de rosto, resolução e desempenho
+
+- **YOLO de rosto** (`camera_utils.py`): roda num processo separado, com entrada 128 px (~2 detecções/s na Jetson, o dobro do antigo 160). As caixas são suavizadas entre detecções e somem após 1,5 s sem confirmação. Há um checkbox "Detectar rostos (YOLO)" no painel; `--no-faces` desliga e `--face-size N` muda a entrada (múltiplo de 32).
+- **Modelo mais leve:** se existirem `cfg/yolov3-tiny-face.cfg` e `model-weights/yolov3-tiny-face.weights`, eles são usados no lugar do yolov3-face completo.
+- **Resolução:** o sensor é consultado em runtime e a cor usa 640×480@30 por padrão (medido: 29 fps reais). 1280×1024 é anunciado a 30 fps mas entrega ~5 fps (limite do USB 2.0) e trava se combinado com profundidade; só com `--res 1280x1024`.
+- **Leveza:** o realce (CLAHE + unsharp) roda no tamanho de exibição, sem filtro bilateral; a profundidade não usa mais `inpaint` (fechamento morfológico no lugar); redimensionamento com INTER_LINEAR.
+
 ## Requisitos
 
 ### Hardware

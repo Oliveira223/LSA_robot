@@ -1,6 +1,4 @@
-import os
 import sys
-import glob
 import tkinter as tk
 
 import cv2
@@ -9,6 +7,9 @@ from primesense import openni2
 from primesense import _openni2 as c_api
 import customtkinter as ctk
 from PIL import Image, ImageTk
+
+from camera_utils import (configurar_cor, configurar_depth, criar_detector_rosto,
+                          desenhar_rostos, localizar_openni2_redist)
 
 # ─── Compat: customtkinter 3.x (Python 3.6 / Jetson aarch64) ──────────
 # O código foi escrito para customtkinter >= 5.2, mas o Python 3.6 do
@@ -68,29 +69,6 @@ ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
 
-def _openni2_redist_dir():
-    """Localiza o diretório com libOpenNI2.so (e OpenNI2/Drivers).
-
-    O código original fixava /usr/lib/x86_64-linux-gnu, que não existe
-    em Jetson/aarch64. Aqui procuramos nos caminhos comuns.
-    """
-    candidatos = [
-        "/usr/lib/aarch64-linux-gnu",
-        "/usr/lib/x86_64-linux-gnu",
-        "/usr/lib",
-        "/usr/local/lib",
-        os.environ.get("OPENNI2_REDIST", ""),
-    ]
-    for d in candidatos:
-        if d and glob.glob(os.path.join(d, "libOpenNI2.so*")):
-            return d
-    for base in ("/usr/lib", "/usr/local/lib", "/opt"):
-        hits = glob.glob(os.path.join(base, "**", "libOpenNI2.so*"), recursive=True)
-        if hits:
-            return os.path.dirname(hits[0])
-    return ""  # deixa o OpenNI2 tentar o padrão do sistema
-
-
 class XtionAppGUI(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -106,6 +84,16 @@ class XtionAppGUI(ctk.CTk):
         self.attributes("-fullscreen", self._fullscreen)
         self.bind("<F11>", self._toggle_fullscreen)
         self.bind("<Escape>", self._toggle_fullscreen)
+
+        self._res_cor = "auto"
+        self._face_size = 128
+        self._faces_ativo = "--no-faces" not in sys.argv
+        for _i, _a in enumerate(sys.argv):
+            if _a == "--res" and _i + 1 < len(sys.argv):
+                self._res_cor = sys.argv[_i + 1]
+            if _a == "--face-size" and _i + 1 < len(sys.argv):
+                self._face_size = int(sys.argv[_i + 1])
+        self.detector = None          # criado sob demanda (processo YOLO)
 
         self.dev          = None
         self.ir_stream    = None
@@ -157,6 +145,14 @@ class XtionAppGUI(ctk.CTk):
         self.grid_rowconfigure(0, weight=1)
         self._build_sidebar()
         self._build_video_area()
+
+        self._clahe  = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        self._kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        if self._faces_ativo and self.detector is None:  # o checkbox pode ja ter criado
+            self.detector = criar_detector_rosto(self._face_size)
+            if self.detector is None:
+                self._faces_ativo = False
+                self.faces_var.set(False)
 
         self.modo_atual = "__init__"
         self.mudar_modo(self._modo_inicial)
@@ -232,6 +228,11 @@ class XtionAppGUI(ctk.CTk):
                         command=lambda: setattr(self, 'enhance', self.enhance_var.get()),
                         font=ctk.CTkFont(size=11)).grid(row=13, column=0, padx=20, pady=6)
 
+        self.faces_var = ctk.BooleanVar(value=self._faces_ativo)
+        ctk.CTkCheckBox(self.sidebar, text="Detectar rostos (YOLO)",
+                        variable=self.faces_var, command=self._on_faces_toggle,
+                        font=ctk.CTkFont(size=11)).grid(row=14, column=0, padx=20, pady=6)
+
         # Status
         try:
             info = self.dev.get_device_info()
@@ -241,11 +242,11 @@ class XtionAppGUI(ctk.CTk):
 
         ctk.CTkLabel(self.sidebar, text=f"● Online\n{nome}",
                      font=ctk.CTkFont(size=10),
-                     text_color="#00f5c4", justify="center").grid(row=14, column=0, padx=20, pady=8)
+                     text_color="#00f5c4", justify="center").grid(row=15, column=0, padx=20, pady=8)
 
         ctk.CTkButton(self.sidebar, text="✕  Sair",
                       fg_color="#7a1f1f", hover_color="#a03030",
-                      command=self.ao_fechar).grid(row=15, column=0, padx=20, pady=(4, 20))
+                      command=self.ao_fechar).grid(row=16, column=0, padx=20, pady=(4, 20))
 
     def _build_video_area(self):
         self.video_container = ctk.CTkFrame(self, corner_radius=10)
@@ -268,13 +269,15 @@ class XtionAppGUI(ctk.CTk):
 
     def inicializar_sensor(self):
         try:
-            redist = _openni2_redist_dir()
+            redist = localizar_openni2_redist()
             print("OpenNI2 redist dir:", redist or "(padrão do sistema)")
             openni2.initialize(redist)
             self.dev          = openni2.Device.open_any()
             self.depth_stream = self.dev.create_depth_stream()
             self.ir_stream    = self.dev.create_ir_stream()
             self.color_stream = self.dev.create_color_stream()
+            configurar_cor(self.color_stream, self._res_cor)
+            configurar_depth(self.depth_stream)
             return True
         except Exception as e:
             print("Erro ao inicializar sensor:", e)
@@ -286,6 +289,14 @@ class XtionAppGUI(ctk.CTk):
         for i, (name, _) in enumerate(self.COLORMAPS):
             if name == value:
                 self.colormap_idx = i
+
+    def _on_faces_toggle(self):
+        self._faces_ativo = self.faces_var.get()
+        if self._faces_ativo and self.detector is None:
+            self.detector = criar_detector_rosto(self._face_size)
+            if self.detector is None:  # sem modelo: desliga a caixa
+                self._faces_ativo = False
+                self.faces_var.set(False)
 
     def _parar_todos(self):
         for s in [self.ir_stream, self.depth_stream, self.color_stream]:
@@ -340,56 +351,72 @@ class XtionAppGUI(ctk.CTk):
     # ─── Processamento ────────────────────────────────────────
 
     def melhorar(self, frame_bgr):
+        """CLAHE + unsharp mask. Roda no tamanho de EXIBICAO (nao no da
+        camera) e sem filtro bilateral — o bilateral era o maior custo."""
         if not self.enhance:
             return frame_bgr
-        f    = cv2.bilateralFilter(frame_bgr, 5, 35, 35)
-        lab  = cv2.cvtColor(f, cv2.COLOR_BGR2LAB)
+        lab  = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        f    = cv2.cvtColor(cv2.merge([clahe.apply(l), a, b]), cv2.COLOR_LAB2BGR)
+        f    = cv2.cvtColor(cv2.merge([self._clahe.apply(l), a, b]), cv2.COLOR_LAB2BGR)
         blur = cv2.GaussianBlur(f, (0, 0), 1.2)
         return cv2.addWeighted(f, 1.35, blur, -0.35, 0)
 
-    def ler_depth(self):
+    def _depth8(self):
+        """Le 1 frame de profundidade -> imagem 8 bits, sem inpaint (TELEA
+        era o maior custo). Buracos (0) sao preenchidos por fechamento
+        morfologico, que e ordens de grandeza mais barato."""
         frame = self.depth_stream.read_frame()
         img   = np.frombuffer(frame.get_buffer_as_uint16(),
                               dtype=np.uint16).reshape(frame.height, frame.width)
-        mask  = (img == 0).astype(np.uint8)
-        img8  = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
-        img8  = cv2.inpaint(img8, mask, 3, cv2.INPAINT_TELEA)
+        validos = img[img > 0]
+        topo = int(validos.max()) if validos.size else 1
+        base = int(validos.min()) if validos.size else 0
+        img8 = cv2.convertScaleAbs(img, alpha=255.0 / max(1, topo - base),
+                                   beta=-255.0 * base / max(1, topo - base))
+        img8[img == 0] = 0
         if self.enhance:
-            img8 = cv2.bilateralFilter(img8, 7, 50, 50)
-        return cv2.applyColorMap(img8, self.COLORMAPS[self.colormap_idx][1])
+            img8 = cv2.morphologyEx(img8, cv2.MORPH_CLOSE, self._kernel)
+            img8 = cv2.GaussianBlur(img8, (5, 5), 0)
+        return img8
+
+    def ler_depth(self):
+        return cv2.applyColorMap(self._depth8(), self.COLORMAPS[self.colormap_idx][1])
 
     def ler_depth_dual(self):
-        """Lê 1 frame de profundidade e devolve (colormap_bgr, cinza_bgr)
-        a partir da MESMA leitura — usado no modo QUAD."""
-        frame = self.depth_stream.read_frame()
-        img   = np.frombuffer(frame.get_buffer_as_uint16(),
-                              dtype=np.uint16).reshape(frame.height, frame.width)
-        mask  = (img == 0).astype(np.uint8)
-        img8  = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
-        img8  = cv2.inpaint(img8, mask, 3, cv2.INPAINT_TELEA)
-        if self.enhance:
-            img8 = cv2.bilateralFilter(img8, 7, 50, 50)
+        """(colormap_bgr, cinza_bgr) a partir da MESMA leitura — modo QUAD."""
+        img8 = self._depth8()
         cm   = cv2.applyColorMap(img8, self.COLORMAPS[self.colormap_idx][1])
-        gray = cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
-        return cm, gray
+        return cm, cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
 
-    def ler_ir(self):
+    def ler_ir(self, alvo=None):
         frame = self.ir_stream.read_frame()
         img   = np.frombuffer(frame.get_buffer_as_uint16(),
                               dtype=np.uint16).reshape(frame.height, frame.width)
-        img8  = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+        img8  = cv2.convertScaleAbs(img, alpha=255.0 / max(1, int(img.max())))
         bgr   = cv2.cvtColor(img8, cv2.COLOR_GRAY2BGR)
+        if alvo:
+            bgr = cv2.resize(bgr, alvo, interpolation=cv2.INTER_LINEAR)
         return self.melhorar(bgr)
 
-    def ler_color(self):
+    def ler_color(self, alvo=None):
+        """Frame de cor. `alvo`=(w, h) reduz ANTES do realce e do desenho
+        (a camera pode estar em 1280x960; nao faz sentido processar isso
+        tudo pra mostrar num painel menor). O YOLO recebe o frame cru."""
         frame = self.color_stream.read_frame()
         img   = np.frombuffer(frame.get_buffer_as_uint8(),
                               dtype=np.uint8).reshape(frame.height, frame.width, 3)
         bgr   = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        return self.melhorar(bgr)
+        caixas = []
+        if self._faces_ativo and self.detector is not None:
+            self.detector.submit(bgr)
+            caixas = self.detector.boxes()
+        if alvo and alvo[0] > 50 and alvo[1] > 50:
+            ex, ey = alvo[0] / bgr.shape[1], alvo[1] / bgr.shape[0]
+            bgr = cv2.resize(bgr, alvo, interpolation=cv2.INTER_LINEAR)
+            caixas = [(int(x * ex), int(y * ey), int(w * ex), int(h * ey)) for (x, y, w, h) in caixas]
+        bgr = self.melhorar(bgr)
+        desenhar_rostos(bgr, caixas)
+        return bgr
 
     def adicionar_label(self, img, texto, cor=(255, 255, 255)):
         """Escreve um label no canto superior esquerdo do frame."""
@@ -416,7 +443,7 @@ class XtionAppGUI(ctk.CTk):
             fw, fh = w // 2, h
             resized = []
             for frame, label, cor in frames_labels:
-                f = cv2.resize(frame, (fw - 4, fh - 4), interpolation=cv2.INTER_LANCZOS4)
+                f = cv2.resize(frame, (fw - 4, fh - 4), interpolation=cv2.INTER_LINEAR)
                 f = self.adicionar_label(f, label, cor)
                 resized.append(f)
             linha = np.hstack(resized)
@@ -432,9 +459,9 @@ class XtionAppGUI(ctk.CTk):
             fw_bot = w // 2
             fh_bot = h - fh_top
 
-            f0 = cv2.resize(frames_labels[0][0], (fw_top - 4, fh_top - 4), interpolation=cv2.INTER_LANCZOS4)
-            f1 = cv2.resize(frames_labels[1][0], (fw_top - 4, fh_top - 4), interpolation=cv2.INTER_LANCZOS4)
-            f2 = cv2.resize(frames_labels[2][0], (fw_bot - 4, fh_bot - 4), interpolation=cv2.INTER_LANCZOS4)
+            f0 = cv2.resize(frames_labels[0][0], (fw_top - 4, fh_top - 4), interpolation=cv2.INTER_LINEAR)
+            f1 = cv2.resize(frames_labels[1][0], (fw_top - 4, fh_top - 4), interpolation=cv2.INTER_LINEAR)
+            f2 = cv2.resize(frames_labels[2][0], (fw_bot - 4, fh_bot - 4), interpolation=cv2.INTER_LINEAR)
 
             f0 = self.adicionar_label(f0, frames_labels[0][1], frames_labels[0][2])
             f1 = self.adicionar_label(f1, frames_labels[1][1], frames_labels[1][2])
@@ -484,22 +511,22 @@ class XtionAppGUI(ctk.CTk):
 
             if modo == "DEPTH":
                 frame_bgr = self.ler_depth()
-                frame_bgr = cv2.resize(frame_bgr, (w_cont, h_cont), interpolation=cv2.INTER_LANCZOS4) if w_cont > 100 else frame_bgr
+                frame_bgr = cv2.resize(frame_bgr, (w_cont, h_cont), interpolation=cv2.INTER_LINEAR) if w_cont > 100 else frame_bgr
                 info = "Profundidade"
 
             elif modo == "IR":
-                frame_bgr = self.ler_ir()
-                frame_bgr = cv2.resize(frame_bgr, (w_cont, h_cont), interpolation=cv2.INTER_LANCZOS4) if w_cont > 100 else frame_bgr
+                frame_bgr = self.ler_ir((w_cont, h_cont) if w_cont > 100 else None)
+                frame_bgr = cv2.resize(frame_bgr, (w_cont, h_cont), interpolation=cv2.INTER_LINEAR) if w_cont > 100 else frame_bgr
                 info = "Infravermelho"
 
             elif modo == "COLOR":
-                frame_bgr = self.ler_color()
-                frame_bgr = cv2.resize(frame_bgr, (w_cont, h_cont), interpolation=cv2.INTER_LANCZOS4) if w_cont > 100 else frame_bgr
+                frame_bgr = self.ler_color((w_cont, h_cont) if w_cont > 100 else None)
+                frame_bgr = cv2.resize(frame_bgr, (w_cont, h_cont), interpolation=cv2.INTER_LINEAR) if w_cont > 100 else frame_bgr
                 info = "Cor RGB"
 
             elif modo == "DUAL":
                 fd = self.ler_depth()
-                fi = self.ler_ir()
+                fi = self.ler_ir((w_cont // 2, h_cont))
                 frame_bgr = self.montar_grid([
                     (fd, "DEPTH", (0, 200, 255)),
                     (fi, "IR",    (200, 200, 200)),
@@ -508,8 +535,8 @@ class XtionAppGUI(ctk.CTk):
 
             elif modo == "TRIAL":
                 fd = self.ler_depth()
-                fi = self.ler_ir()
-                fc = self.ler_color()
+                fi = self.ler_ir((w_cont // 2, h_cont * 2 // 3))
+                fc = self.ler_color((w_cont // 2, h_cont // 3))
                 frame_bgr = self.montar_grid([
                     (fd, "DEPTH", (0, 200, 255)),
                     (fi, "IR",    (200, 200, 200)),
@@ -519,7 +546,7 @@ class XtionAppGUI(ctk.CTk):
 
             elif modo == "QUAD":
                 dcm, dgy = self.ler_depth_dual()
-                fc  = self.ler_color()
+                fc  = self.ler_color((w_cont // 2, h_cont // 2))
                 cr  = cv2.resize(fc, (dcm.shape[1], dcm.shape[0]))
                 ov  = cv2.addWeighted(cr, 0.6, dcm, 0.4, 0)
                 frame_bgr = self.montar_quad([
@@ -546,7 +573,7 @@ class XtionAppGUI(ctk.CTk):
             print("Erro no vídeo:", e)
 
         # modos com 3-4 painéis são mais pesados: ~30 FPS em vez de ~60
-        _delay = 33 if self.modo_atual in ("QUAD", "TRIAL") else 16
+        _delay = 33
         self.loop_id = self.after(_delay, self.atualizar_video)
 
     # ─── Cleanup ──────────────────────────────────────────────
@@ -559,6 +586,8 @@ class XtionAppGUI(ctk.CTk):
         if self.loop_id:
             self.after_cancel(self.loop_id)
         self._parar_todos()
+        if self.detector is not None:
+            self.detector.parar()
         try:
             openni2.unload()
         except:
@@ -568,4 +597,7 @@ class XtionAppGUI(ctk.CTk):
 
 if __name__ == "__main__":
     app = XtionAppGUI()
+    # kill/SIGTERM fecha direito (libera o sensor); sem isso o PS1080 trava
+    import signal
+    signal.signal(signal.SIGTERM, lambda *_: app.ao_fechar())
     app.mainloop()

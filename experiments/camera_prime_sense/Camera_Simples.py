@@ -24,16 +24,20 @@ bounding box encontrado sobre o frame atual — o video continua fluido, so a
 caixinha "atualiza" com um pequeno atraso.
 """
 import argparse
-import glob
-import multiprocessing as mp
 import os
 import signal
+import subprocess
 import sys
+import threading
 import time
 
 import cv2
 import numpy as np
 from primesense import openni2
+
+from camera_utils import (HUD_AMARELO, HUD_CIANO, HudTela, MedidorDistancia,
+                          configurar_cor, configurar_depth, criar_detector_rosto,
+                          desenhar_alvos_hud, localizar_openni2_redist)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -44,9 +48,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.expanduser("~/dev/LSA_robot/src"))
 from common.janela import tamanho_tela_cheia
 try:
-    from jetson.mic_vad import OuvinteVAD, ErroDeMic
+    from jetson.mic_vad import OuvinteVAD, ErroDeMic, preparar_mic
 except Exception as _erro_import_mic:
     OuvinteVAD = None
+    preparar_mic = None
     ErroDeMic = Exception
     print(f"AVISO: jetson.mic_vad indisponivel ({_erro_import_mic}); "
           "seguindo sem indicador de microfone.", file=sys.stderr)
@@ -57,149 +62,25 @@ except Exception as _erro_import_mock:
     print(f"AVISO: jetson.mic_mock indisponivel ({_erro_import_mock}); "
           "--mic-mock nao vai funcionar.", file=sys.stderr)
 try:
+    from jetson.transcritor import ClienteTranscricao, ErroDeTranscricao
+    from jetson.conversa_client import ClienteConversa, HOST_PADRAO, PORTA_PADRAO
+    from painel_texto import PainelTranscricao
+except Exception as _erro_import_stt:
+    ClienteTranscricao = None
+    ErroDeTranscricao = Exception
+    PainelTranscricao = None
+    ClienteConversa, HOST_PADRAO, PORTA_PADRAO = None, "10.10.10.1", 5005
+    print(f"AVISO: transcricao local indisponivel ({_erro_import_stt}); "
+          "seguindo sem janela de texto.", file=sys.stderr)
+try:
     from jetson.chat_client import ClienteChat, ErroDeChat
 except Exception as _erro_import_chat:
     ClienteChat = None
     ErroDeChat = Exception
     print(f"AVISO: jetson.chat_client indisponivel ({_erro_import_chat}); "
           "seguindo sem chat.", file=sys.stderr)
-FACE_CFG = os.path.join(BASE_DIR, "cfg", "yolov3-face.cfg")
-FACE_WEIGHTS = os.path.join(BASE_DIR, "model-weights", "yolov3-wider_16000.weights")
-
-
-# ─── Deteccao de rosto (YOLOv3-face) num processo separado ──────────────
-def _processo_detector(cfg, weights, tamanho, confianca, nms, fila_frame, fila_boxes):
-    """Corpo do processo filho: carrega a rede uma vez e fica num loop
-    bloqueante pegando o frame mais recente da fila e devolvendo as caixas.
-    Roda isolado (multiprocessing, nao thread) pra nao competir com o laço
-    de video/GUI do processo principal nem atrapalhar o encerramento dele."""
-    net = cv2.dnn.readNetFromDarknet(cfg, weights)
-    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-    nomes = net.getLayerNames()
-    saidas_net = [nomes[int(i) - 1] for i in net.getUnconnectedOutLayers().flatten()]
-
-    while True:
-        frame = fila_frame.get()  # bloqueia ate ter um frame novo
-        if frame is None:  # sentinela de parada
-            break
-
-        altura, largura = frame.shape[:2]
-        blob = cv2.dnn.blobFromImage(frame, 1 / 255.0, (tamanho, tamanho), swapRB=True, crop=False)
-        net.setInput(blob)
-        saidas = net.forward(saidas_net)
-
-        caixas, confs = [], []
-        for saida in saidas:
-            for det in saida:
-                conf = float(det[5])
-                if conf < confianca:
-                    continue
-                cx, cy, bw, bh = det[0] * largura, det[1] * altura, det[2] * largura, det[3] * altura
-                x, y = int(cx - bw / 2), int(cy - bh / 2)
-                caixas.append([x, y, int(bw), int(bh)])
-                confs.append(conf)
-
-        indices = cv2.dnn.NMSBoxes(caixas, confs, confianca, nms)
-        resultado = [tuple(caixas[i]) for i in np.array(indices).flatten()] if len(indices) else []
-
-        # so importa o resultado mais recente: esvazia antes de colocar o novo
-        try:
-            while True:
-                fila_boxes.get_nowait()
-        except Exception:
-            pass
-        fila_boxes.put(resultado)
-
-
-class DetectorRosto:
-    """Cliente do processo de deteccao: submit() manda o frame atual (numa
-    versao reduzida, pra nao pagar o custo de serializar um frame gigante
-    entre processos), boxes() devolve a ultima deteccao disponivel, ja
-    reescalada pro tamanho do frame original."""
-
-    def __init__(self, cfg, weights, tamanho=160, confianca=0.5, nms=0.4, ipc_max_lado=480):
-        ctx = mp.get_context("spawn")  # spawn, nao fork: nao herda o handle
-        # aberto do sensor OpenNI2 nem a conexao X11 do processo pai
-        self.ipc_max_lado = ipc_max_lado
-        self._escala = 1.0
-        self._boxes = []
-        self._fila_frame = ctx.Queue(maxsize=1)
-        self._fila_boxes = ctx.Queue(maxsize=1)
-        self._proc = ctx.Process(
-            target=_processo_detector,
-            args=(cfg, weights, tamanho, confianca, nms, self._fila_frame, self._fila_boxes),
-            daemon=True,
-        )
-        self._proc.start()
-
-    def submit(self, frame_bgr):
-        altura, largura = frame_bgr.shape[:2]
-        maior_lado = max(altura, largura)
-        if maior_lado > self.ipc_max_lado:
-            self._escala = self.ipc_max_lado / maior_lado
-            envio = cv2.resize(frame_bgr, (int(largura * self._escala), int(altura * self._escala)))
-        else:
-            self._escala = 1.0
-            envio = frame_bgr
-        try:
-            self._fila_frame.get_nowait()  # descarta frame antigo nao processado
-        except Exception:
-            pass
-        try:
-            self._fila_frame.put_nowait(envio)
-        except Exception:
-            pass
-
-    def boxes(self):
-        try:
-            while True:
-                self._boxes = self._fila_boxes.get_nowait()
-        except Exception:
-            pass
-        if self._boxes and self._escala != 1.0:
-            inv = 1.0 / self._escala
-            return [(int(x * inv), int(y * inv), int(w * inv), int(h * inv)) for (x, y, w, h) in self._boxes]
-        return self._boxes
-
-    def parar(self):
-        try:
-            self._fila_frame.put_nowait(None)
-        except Exception:
-            pass
-        self._proc.join(timeout=3)
-        if self._proc.is_alive():
-            self._proc.terminate()
-
-
-def desenhar_rostos(cor, caixas):
-    for (x, y, w, h) in caixas:
-        cv2.rectangle(cor, (x, y), (x + w, y + h), (0, 255, 0), 2)
-        cv2.putText(cor, "rosto", (x, max(0, y - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-
-# ─── OpenNI2: localizar o runtime ──────────────────────────────────────
-def localizar_openni2_redist():
-    candidatos = [
-        "/usr/lib/aarch64-linux-gnu",
-        "/usr/lib/x86_64-linux-gnu",
-        "/usr/lib",
-        "/usr/local/lib",
-        os.environ.get("OPENNI2_REDIST", ""),
-    ]
-    for d in candidatos:
-        if d and glob.glob(os.path.join(d, "libOpenNI2.so*")):
-            return d
-    for base in ("/usr/lib", "/usr/local/lib", "/opt"):
-        hits = glob.glob(os.path.join(base, "**", "libOpenNI2.so*"), recursive=True)
-        if hits:
-            return os.path.dirname(hits[0])
-    return ""  # deixa o OpenNI2 tentar o padrão do sistema
-
-
 # ─── Sensor ─────────────────────────────────────────────────────────────
-def iniciar_sensor():
+def iniciar_sensor(res="auto", distancia=True):
     """So abre o stream de cor. O stream de profundidade nao e mais usado
     (a miniatura do canto agora e o grafico de som, nao a profundidade) —
     fora de nao servir mais pra nada aqui, era a parte mais pesada de CPU
@@ -209,15 +90,33 @@ def iniciar_sensor():
     openni2.initialize(localizar_openni2_redist())
     dev = openni2.Device.open_any()
     color_stream = dev.create_color_stream()
+    configurar_cor(color_stream, res)
     color_stream.start()
-    return dev, color_stream
+    depth_stream = None
+    if distancia:
+        # profundidade so pra medir a distancia dos rostos. Se falhar, o app
+        # segue normalmente so com a cor.
+        try:
+            depth_stream = dev.create_depth_stream()
+            configurar_depth(depth_stream)
+            try:
+                dev.set_image_registration_mode(openni2.IMAGE_REGISTRATION_DEPTH_TO_COLOR)
+            except Exception as e:
+                print(f"AVISO: registro depth->cor indisponivel ({e})", file=sys.stderr)
+            depth_stream.start()
+        except Exception as e:
+            print(f"AVISO: profundidade indisponivel ({e}); sem distancia.", file=sys.stderr)
+            depth_stream = None
+    return dev, color_stream, depth_stream
 
 
-def parar_sensor(color_stream):
-    try:
-        color_stream.stop()
-    except Exception:
-        pass
+def parar_sensor(color_stream, depth_stream=None):
+    for st in (depth_stream, color_stream):
+        try:
+            if st is not None:
+                st.stop()
+        except Exception:
+            pass
     try:
         openni2.unload()
     except Exception:
@@ -232,6 +131,56 @@ def ler_color(color_stream):
     return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
 
+class LeitorDepth:
+    """Le a profundidade numa thread propria e guarda so o mapa mais recente.
+    read_frame() do OpenNI2 bloqueia sem timeout — se o stream de
+    profundidade travar (visto depois de resets USB), so ESTA thread fica
+    presa; o video continua e a distancia some (mapa() devolve None depois
+    de ATRASO_MAX_S sem quadro novo)."""
+
+    ATRASO_MAX_S = 1.0
+
+    def __init__(self, depth_stream):
+        self._stream = depth_stream
+        self._mapa = None
+        self._t = 0.0
+        self._lock = threading.Lock()
+        self._rodando = True
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        n, erros, t_log = 0, 0, time.time()
+        while self._rodando:
+            try:
+                frame = self._stream.read_frame()
+                mapa = np.frombuffer(frame.get_buffer_as_uint16(), dtype=np.uint16).reshape(
+                    frame.height, frame.width).copy()
+            except Exception as e:
+                if erros == 0:
+                    print(f"AVISO: erro lendo profundidade ({e!r})", file=sys.stderr, flush=True)
+                erros += 1
+                time.sleep(0.2)
+                continue
+            n += 1
+            with self._lock:
+                self._mapa, self._t = mapa, time.time()
+            if time.time() - t_log > 5:
+                validos = int((mapa > 0).sum())
+                print(f"depth: {n} quadros, {erros} erros, {validos}/{mapa.size} px validos, "
+                      f"centro={int(mapa[mapa.shape[0] // 2, mapa.shape[1] // 2])} mm",
+                      file=sys.stderr, flush=True)
+                n, erros, t_log = 0, 0, time.time()
+
+    def mapa(self):
+        with self._lock:
+            if self._mapa is None or time.time() - self._t > self.ATRASO_MAX_S:
+                return None
+            return self._mapa
+
+    def parar(self):
+        self._rodando = False
+
+
 # ─── Composição da tela ─────────────────────────────────────────────────
 def _texto_com_contorno(img, texto, pos, escala, cor):
     """cv2.putText com um contorno preto por baixo, pra ficar legivel mesmo
@@ -243,106 +192,117 @@ def _texto_com_contorno(img, texto, pos, escala, cor):
 
 
 class VisualizadorSom:
-    """Forma de onda "de verdade" do microfone — picos de amplitude reais,
-    nao uma senoide sintetica — com fundo TRANSPARENTE: desenha direto em
-    cima do recorte da imagem da camera (so escurecido um pouco, pra dar
-    contraste), entao o video continua aparecendo atras da onda. Estilo
-    HUD/terminal de filme de hacker, nao um mini-monitor a parte.
+    """Forma de onda do microfone em barras espelhadas (estilo assistente de
+    voz), desenhada num painel de vidro translucido: o video continua
+    aparecendo atras, so escurecido (TINT). Le
+    jetson.mic_vad.OuvinteVAD.amostras_recentes() (audio cru, mono, int16) e
+    usa o pico de cada faixa de amostras como altura de uma barra."""
 
-    Le jetson.mic_vad.OuvinteVAD.amostras_recentes() (audio cru, mono,
-    int16) e desenha o min/max de cada faixa de amostras como uma barra
-    vertical — a mesma tecnica que editores de audio usam pra plotar forma
-    de onda, entao os picos vem do audio de verdade."""
+    COR_HUD = (255, 220, 0)      # ciano, mesma paleta do resto do HUD
+    COR_FALA = (90, 255, 60)     # verde quando acima do limiar (falando)
+    COR_OFFLINE = (60, 60, 255)  # vermelho — parou de verdade, nao e so silencio
+    TINT = 0.55                  # quanto escurece o video por baixo (0 = transparente)
+    BARRA_PX = 5                 # largura de cada barra (a 1080p)
+    GAP_PX = 3
 
-    COR_HUD = (255, 220, 0)      # ciano, mesma paleta dos outros paineis
-    COR_FALA = (0, 255, 80)      # verde quando acima do limiar (falando)
-    COR_OFFLINE = (0, 0, 255)    # vermelho — parou de verdade, nao e so silencio
-    TINT = 0.15                  # quanto escurece o video por baixo (0 = 100% transparente)
+    def __init__(self):
+        self._suave = None       # alturas anteriores, pra barras descerem suavemente
 
-    def desenhar(self, regiao, ouvinte):
-        """Desenha em cima de `regiao` (recorte do frame da camera, ja do
-        tamanho do painel) e devolve o resultado — nao cria fundo proprio."""
-        preto = np.zeros_like(regiao)
-        regiao = cv2.addWeighted(regiao, 1.0 - self.TINT, preto, self.TINT, 0)
+    def estado_visual(self, ouvinte):
+        """(texto, cor) do indicador do cabecalho."""
+        if ouvinte is None:
+            return "MICROFONE", self.COR_HUD
+        _, _, gravando, vivo = ouvinte.estado()
+        if not vivo:
+            return "MIC OFFLINE", self.COR_OFFLINE
+        return ("OUVINDO", self.COR_FALA) if gravando else ("MICROFONE", self.COR_HUD)
+
+    def desenhar(self, regiao, ouvinte, k=1.0):
+        """Desenha as barras em `regiao` (area livre abaixo do cabecalho)."""
         altura, largura = regiao.shape[:2]
         meio_y = altura // 2
+        barra = max(2, int(self.BARRA_PX * k))
+        passo = barra + max(1, int(self.GAP_PX * k))
+        n = max(1, largura // passo)
+        x_ini = (largura - n * passo + (passo - barra)) // 2
 
-        if ouvinte is None:
-            return regiao
+        _, cor = self.estado_visual(ouvinte)
+        alturas = np.zeros(n, np.float32)
 
-        nivel, limiar, gravando, vivo = ouvinte.estado()
-        if not vivo:
-            cv2.line(regiao, (0, meio_y), (largura, meio_y), self.COR_OFFLINE, 1, cv2.LINE_AA)
-            _texto_com_contorno(regiao, "MIC OFFLINE", (largura // 2 - 78, meio_y - 10),
-                                 0.5, self.COR_OFFLINE)
-            return regiao
+        if ouvinte is not None:
+            nivel, limiar, gravando, vivo = ouvinte.estado()
+            amostras = ouvinte.amostras_recentes() if vivo else []
+            if vivo and len(amostras) >= n:
+                dados = np.frombuffer(amostras, dtype=np.int16).astype(np.float32)
+                bucket = len(dados) // n
+                dados = dados[-n * bucket:].reshape(n, bucket)
+                pico = np.maximum(np.abs(dados.min(axis=1)), np.abs(dados.max(axis=1)))
+                # teto derivado do limiar de fala: voz normal enche boa parte do painel
+                alturas = np.clip(pico / max(limiar * 6, 3000), 0, 1)
 
-        cor_onda = self.COR_FALA if gravando else self.COR_HUD
-        amostras = ouvinte.amostras_recentes()
-        if len(amostras) < 2:
-            cv2.line(regiao, (0, meio_y), (largura, meio_y), cor_onda, 1, cv2.LINE_AA)
-            return regiao
+        # subida imediata, descida suave — barras "respiram" em vez de piscar
+        if self._suave is None or len(self._suave) != n:
+            self._suave = np.zeros(n, np.float32)
+        self._suave = np.maximum(alturas, self._suave * 0.82)
+        meia = (self._suave * (altura * 0.5 - 2)).astype(np.int32)
 
-        dados = np.frombuffer(amostras, dtype=np.int16).astype(np.float32)
-        bucket = max(1, len(dados) // largura)
-        usavel = (len(dados) // bucket) * bucket
-        dados = dados[-usavel:].reshape(-1, bucket)
-        minimos = dados.min(axis=1)
-        maximos = dados.max(axis=1)
-
-        # teto de amplitude derivado do limiar de fala (RMS) — voz normal
-        # ocupa boa parte da altura do painel sem estourar toda hora
-        teto = max(limiar * 6, 3000)
-        n_colunas = len(minimos)
-        for i in range(n_colunas):
-            x = int(i * largura / n_colunas)
-            y_topo = meio_y - int(np.clip(maximos[i] / teto, -1, 1) * (altura * 0.48))
-            y_base = meio_y - int(np.clip(minimos[i] / teto, -1, 1) * (altura * 0.48))
-            if y_topo == y_base:  # garante pelo menos 1px visivel mesmo em silencio total
-                y_base += 1
-            cv2.line(regiao, (x, y_topo), (x, y_base), cor_onda, 1, cv2.LINE_AA)
-
-        estado_txt = "OUVINDO..." if gravando else "MIC"
-        _texto_com_contorno(regiao, estado_txt, (8, 18), 0.45, cor_onda)
-
+        for i in range(n):
+            x = x_ini + i * passo
+            h = max(1, int(meia[i]))          # 1px de "ponto" mesmo em silencio
+            # borda das barras mais escura -> efeito de degrade do centro pra fora
+            cv2.rectangle(regiao, (x, meio_y - h), (x + barra - 1, meio_y + h), cor, -1)
+        cv2.line(regiao, (0, meio_y), (largura, meio_y), cor, 1, cv2.LINE_AA)
         return regiao
 
 
 def compor_hud_transparente(fundo, visualizador, ouvinte, canto="br", margem=20,
-                             escala=0.28, proporcao=0.6, rotulo="AUDIO WAVE"):
-    """Desenha o painel de `visualizador` direto em cima do video (recorte
-    de `fundo`) em vez de colar uma miniatura opaca — o video continua
-    aparecendo atras da onda (so um pouco escurecido, ver
-    VisualizadorSom.TINT), com a mesma moldura HUD (cantos tipo mira +
-    rotulo) dos outros paineis."""
-    cor_hud = (255, 220, 0)  # ciano tipo HUD, em BGR
-
+                             escala=0.24, proporcao=0.36, rotulo=None):
+    """Painel de vidro com a onda do mic, no `canto` da tela: fundo do video
+    escurecido, moldura fina com cantos, cabecalho com indicador de status.
+    Tamanho e margens acompanham a resolucao (referencia 1080p)."""
     h, w = fundo.shape[:2]
+    k = max(0.6, h / 1080.0)
     mw = int(w * escala)
     mh = int(mw * proporcao)
+    mx = max(margem, int(70 * k))     # afasta dos colchetes/rodape do HUD
+    my = max(margem, int(90 * k))
 
     if canto == "tl":
-        x, y = margem, margem
+        x, y = mx, my
     elif canto == "tr":
-        x, y = w - mw - margem, margem
+        x, y = w - mw - mx, my
     elif canto == "bl":
-        x, y = margem, h - mh - margem
+        x, y = mx, h - mh - my
     else:  # "br"
-        x, y = w - mw - margem, h - mh - margem
+        x, y = w - mw - mx, h - mh - my
 
     saida = fundo
-    regiao = saida[y:y + mh, x:x + mw]
-    saida[y:y + mh, x:x + mw] = visualizador.desenhar(regiao, ouvinte)
+    # vidro: escurece o video atras do painel
+    saida[y:y + mh, x:x + mw] = cv2.convertScaleAbs(
+        saida[y:y + mh, x:x + mw], alpha=1.0 - visualizador.TINT)
 
-    tick = 14
-    for (cx, cy, dx, dy) in [(x, y, 1, 1), (x + mw, y, -1, 1),
-                              (x, y + mh, 1, -1), (x + mw, y + mh, -1, -1)]:
-        cv2.line(saida, (cx, cy), (cx + dx * tick, cy), cor_hud, 2, cv2.LINE_AA)
-        cv2.line(saida, (cx, cy), (cx, cy + dy * tick), cor_hud, 2, cv2.LINE_AA)
+    texto, cor = visualizador.estado_visual(ouvinte)
+    cab = int(34 * k)                 # altura do cabecalho
+    pad = int(12 * k)
 
-    cv2.putText(saida, rotulo, (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                cor_hud, 1, cv2.LINE_AA)
+    # cabecalho: ponto de status (pulsa quando ouvindo) + texto
+    cy = y + cab // 2
+    pulso = 0.5 + 0.5 * np.sin(time.time() * 6) if texto == "OUVINDO" else 0.0
+    cv2.circle(saida, (x + pad + int(6 * k), cy), int((6 + 2 * pulso) * k), cor, -1, cv2.LINE_AA)
+    _texto_com_contorno(saida, texto, (x + pad + int(22 * k), cy + int(6 * k)), 0.6 * k, cor)
+    cv2.line(saida, (x + pad, y + cab), (x + mw - pad, y + cab), cor, 1, cv2.LINE_AA)
 
+    # onda na area abaixo do cabecalho
+    area = saida[y + cab + 2:y + mh - 4, x + pad:x + mw - pad]
+    visualizador.desenhar(area, ouvinte, k)
+
+    # moldura fina + cantos grossos
+    cv2.rectangle(saida, (x, y), (x + mw, y + mh), cor, 1, cv2.LINE_AA)
+    tick = int(16 * k)
+    for (cx_, cy_, dx, dy) in [(x, y, 1, 1), (x + mw, y, -1, 1),
+                                (x, y + mh, 1, -1), (x + mw, y + mh, -1, -1)]:
+        cv2.line(saida, (cx_, cy_), (cx_ + dx * tick, cy_), cor, max(2, int(3 * k)), cv2.LINE_AA)
+        cv2.line(saida, (cx_, cy_), (cx_, cy_ + dy * tick), cor, max(2, int(3 * k)), cv2.LINE_AA)
     return saida
 
 
@@ -438,6 +398,81 @@ def _on_sigterm(signum, frame):
     raise SystemExit(0)
 
 
+def _tela_cheia_wnck(titulo):
+    codigo = (
+        "import gi\n"
+        "gi.require_version('Wnck','3.0')\n"
+        "from gi.repository import Wnck, Gtk\n"
+        "Wnck.set_client_type(Wnck.ClientType.PAGER)\n"
+        "s=Wnck.Screen.get_default(); s.force_update()\n"
+        "[w.set_fullscreen(True) for w in s.get_windows() if w.get_name()==%r]\n"
+        "Gtk.main_iteration_do(False)\n" % titulo
+    )
+    try:
+        subprocess.Popen(["/usr/bin/python3", "-c", codigo],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+STATUS_ESPERA = "/tmp/c2gelsa-status"
+
+
+def tela_espera():
+    """Tela cheia "aguardando a camera": nao abre o sensor. Mostra o texto que
+    o script de autostart escreve em STATUS_ESPERA (uma linha por \\n) e fica
+    ate ser encerrada (o autostart mata este processo quando o app abre)."""
+    from camera_utils import _colchetes, _texto
+    largura, altura = tamanho_tela_cheia()
+    k = max(0.6, altura / 1080.0)
+    janela = "C-2GELSA espera"
+    cv2.startWindowThread()
+    cv2.namedWindow(janela, cv2.WINDOW_NORMAL)
+    fundo = np.zeros((altura, largura, 3), np.uint8)
+    fundo[:] = (28, 20, 12)
+    fundo[::4] = (36, 27, 17)          # scanlines
+    quadros = 0
+    while True:
+        t = time.time()
+        img = fundo.copy()
+        m = int(20 * k)
+        _colchetes(img, m, m, largura - m, altura - m, int(44 * k), HUD_CIANO, max(2, int(3 * k)))
+
+        (tw, _), _ = cv2.getTextSize("C-2GELSA", cv2.FONT_HERSHEY_DUPLEX, 3.2 * k, max(3, int(5 * k)))
+        cx, cy = largura // 2, int(altura * 0.40)
+        cv2.putText(img, "C-2GELSA", (cx - tw // 2, cy), cv2.FONT_HERSHEY_DUPLEX, 3.2 * k,
+                    (255, 255, 255), max(3, int(5 * k)), cv2.LINE_AA)
+
+        try:
+            with open(STATUS_ESPERA) as f:
+                linhas = f.read().strip().split("\n") or [""]
+        except OSError:
+            linhas = ["INICIANDO..."]
+        y = cy + int(90 * k)
+        for i, linha in enumerate(linhas):
+            escala = (0.95 if i == 0 else 0.7) * k
+            cor = HUD_AMARELO if i == 0 else HUD_CIANO
+            (lw, _), _ = cv2.getTextSize(linha, cv2.FONT_HERSHEY_DUPLEX, escala, 2)
+            _texto(img, linha, (cx - lw // 2, y), escala, cor)
+            y += int(48 * k)
+
+        # barra de progresso indeterminada (um trecho que corre de lado a lado)
+        bw, bh = int(largura * 0.28), max(4, int(6 * k))
+        bx, by = cx - bw // 2, y + int(30 * k)
+        cv2.rectangle(img, (bx, by), (bx + bw, by + bh), (70, 55, 30), -1)
+        seg = bw // 4
+        pos = int(((t * 0.6) % 1.0) * (bw + seg)) - seg
+        x0, x1 = bx + max(0, pos), bx + min(bw, pos + seg)
+        if x1 > x0:
+            cv2.rectangle(img, (x0, by), (x1, by + bh), HUD_CIANO, -1)
+
+        cv2.imshow(janela, img)
+        if quadros == 10:
+            _tela_cheia_wnck(janela)
+        quadros += 1
+        cv2.waitKey(50)
+
+
 def main():
     signal.signal(signal.SIGTERM, _on_sigterm)
 
@@ -454,37 +489,56 @@ def main():
                      help="canto da TELA onde a janela --vitrine aparece (padrao: br; "
                           "diferente de --corner, que e o canto do grafico DENTRO do video)")
     ap.add_argument("--no-faces", action="store_true",
-                     help="desliga a deteccao de rosto (YOLOv3-face; roda em processo a parte, "
-                          "~1 deteccao/seg, mas ainda consome uma CPU inteira)")
-    ap.add_argument("--face-size", type=int, default=160,
-                     help="entrada da rede YOLO em pixels (padrao 160; menor = mais rapido)")
+                     help="desliga a deteccao de rosto (YOLO-face; roda em processo a parte)")
+    ap.add_argument("--face-size", type=int, default=128,
+                     help="entrada da rede YOLO em pixels, multiplo de 32 (padrao 128; menor = mais rapido)")
+    ap.add_argument("--res", default="auto",
+                     help="resolucao da camera de cor: auto (maior com >=15fps) ou LxA, ex. 640x480")
     ap.add_argument("--face-conf", type=float, default=0.5,
                      help="confianca minima da deteccao de rosto (padrao 0.5)")
+    ap.add_argument("--espera", action="store_true",
+                     help="so mostra a tela 'aguardando a camera' (usada pelo autostart)")
+    ap.add_argument("--no-distancia", action="store_true",
+                     help="nao le a profundidade (sem a distancia dos rostos)")
     ap.add_argument("--no-mic", action="store_true",
                      help="desliga o grafico de nivel do microfone")
     ap.add_argument("--mic-limiar", type=int, default=None,
                      help="limiar de RMS pra considerar 'falando' (ajuste fino do VAD)")
+    ap.add_argument("--mic-ganho", type=int, default=2300,
+                     help="ganho de captura do mic da PrimeSense, 0-4182 (padrao 2300; "
+                          "o do mic_vad e 1700 e exigia falar alto; 3576 de fabrica satura)")
+    ap.add_argument("--mic-silencio", type=float, default=0.6,
+                     help="segundos de silencio pra fechar a frase (padrao 0.6)")
     ap.add_argument("--mic-mock", action="store_true",
                      help="grafico de onda com dados SIMULADOS (jetson.mic_mock), sem "
                           "precisar de mic de verdade — util quando o hardware esta "
                           "instavel mas ainda se quer mostrar o grafico bonito. Nunca "
                           "manda audio pro chat (so visual). Ignora --mic-limiar/--no-mic")
+    ap.add_argument("--stt", choices=("local", "pc", "off"), default="local",
+                     help="janela de texto com a fala: 'local' transcreve na propria Jetson "
+                          "(Vosk, offline; padrao), 'pc' usa o chat com o pc.server_voz, "
+                          "'off' desliga")
+    ap.add_argument("--cerebro", default="%s:%d" % (HOST_PADRAO, PORTA_PADRAO), metavar="HOST:PORTA",
+                     help="servidor de conversa na Jetson 1 (padrao %s:%d, pelo cabo). Cada frase "
+                          "transcrita vai pra la e a resposta (texto + voz) volta; so vale com "
+                          "--stt local" % (HOST_PADRAO, PORTA_PADRAO))
+    ap.add_argument("--no-cerebro", action="store_true",
+                     help="so transcreve, sem conversar com a Jetson 1")
     ap.add_argument("--no-chat", action="store_true",
-                     help="desliga o chat por voz com o PC (so fica o indicador de mic)")
+                     help="atalho pra --stt off (so fica o indicador de mic)")
     ap.add_argument("--chat-host", default="127.0.0.1",
                      help="IP do PC rodando pc.server_voz (padrao 127.0.0.1)")
     ap.add_argument("--chat-port", type=int, default=5000,
                      help="porta do pc.server_voz (padrao 5000)")
+    ap.add_argument("--dump-frames", metavar="DIR", default=None,
+                     help="salva um quadro cru da camera a cada 0.4 s em DIR (pra avaliar detectores offline)")
+    ap.add_argument("--profile", action="store_true",
+                     help="imprime no log o tempo medio de cada etapa do pipeline")
     args = ap.parse_args()
+    if args.espera:
+        return tela_espera()
 
-    detector = None
-    if not args.no_faces:
-        if os.path.isfile(FACE_CFG) and os.path.isfile(FACE_WEIGHTS):
-            detector = DetectorRosto(FACE_CFG, FACE_WEIGHTS,
-                                      tamanho=args.face_size, confianca=args.face_conf)
-        else:
-            print(f"AVISO: modelo YOLO de rosto nao encontrado ({FACE_CFG} / "
-                  f"{FACE_WEIGHTS}); seguindo sem deteccao de rosto.", file=sys.stderr)
+    detector = None if args.no_faces else criar_detector_rosto(args.face_size, args.face_conf)
 
     # OpenNI2 abre a interface de video da PrimeSense PRIMEIRO, sem nada mais
     # mexendo no mesmo dispositivo USB ao mesmo tempo — visto na pratica
@@ -497,7 +551,11 @@ def main():
     # abre logo apos o video, mesmo sozinho — sem o video aberto junto —
     # funciona sempre; parece precisar de um respiro no barramento USB
     # depois que o stream de video comeca a transferir de verdade).
-    _dev, color_stream = iniciar_sensor()
+    if preparar_mic is not None and not args.no_mic and not args.mic_mock:
+        preparar_mic()   # antes do video: ver o motivo em jetson.mic_vad.preparar_mic
+    _dev, color_stream, depth_stream = iniciar_sensor(args.res, not args.no_distancia)
+    medidor = MedidorDistancia() if depth_stream is not None else None
+    leitor_depth = LeitorDepth(depth_stream) if depth_stream is not None else None
     time.sleep(1.5)
     visual_som = VisualizadorSom()
 
@@ -510,14 +568,39 @@ def main():
                   file=sys.stderr)
     elif not args.no_mic and OuvinteVAD is not None:
         try:
-            kwargs = {"limiar_fala": args.mic_limiar} if args.mic_limiar else {}
+            kwargs = {"ganho": args.mic_ganho, "silencio_s": args.mic_silencio}
+            if args.mic_limiar:
+                kwargs["limiar_fala"] = args.mic_limiar
             ouvinte = OuvinteVAD(**kwargs)
         except ErroDeMic as e:
             print(f"AVISO: microfone indisponivel ({e}); seguindo sem indicador de mic.",
                   file=sys.stderr)
 
+    if args.no_chat:
+        args.stt = "off"
+
+    transcritor = painel_texto = conversa = None
+    if args.stt == "local" and not args.mic_mock:
+        if ClienteTranscricao is None:
+            pass  # o aviso do import ja foi impresso
+        elif ouvinte is None:
+            print("AVISO: sem microfone, seguindo sem janela de texto.", file=sys.stderr)
+        else:
+            try:
+                # mesmo OuvinteVAD do indicador de mic (so pode ter um arecord por vez)
+                transcritor = ClienteTranscricao(ouvinte=ouvinte)
+                painel_texto = PainelTranscricao()
+                if not args.no_cerebro and ClienteConversa is not None:
+                    host, _, porta = args.cerebro.partition(":")
+                    conversa = ClienteConversa(host, int(porta or PORTA_PADRAO),
+                                               ao_mensagem=transcritor.adicionar)
+                    transcritor.definir_conversa(conversa)
+            except ErroDeTranscricao as e:
+                print(f"AVISO: transcricao indisponivel ({e}); seguindo sem janela de texto.",
+                      file=sys.stderr)
+
     cliente_chat = None
-    if not args.no_chat and ClienteChat is not None:
+    if args.stt == "pc" and ClienteChat is not None:
         if ouvinte is None:
             print("AVISO: sem microfone, seguindo sem chat.", file=sys.stderr)
         else:
@@ -535,7 +618,7 @@ def main():
     else:
         largura, altura = tamanho_tela_cheia()
 
-    janela = "PrimeSense"
+    janela = "C-2GELSA"
     # sem isso, o backend GTK do highgui as vezes cria a janela mas nunca a
     # mapeia de verdade na tela (fica invisivel, apesar do processo estar
     # rodando e desenhando normalmente) quando o app e' lancado via SSH/nohup
@@ -547,51 +630,153 @@ def main():
     # janela já tem conteúdo (mapeada na tela) — pedir antes do primeiro
     # imshow faz o WM ignorar o hint silenciosamente.
     primeiro_frame = True
+    quadros = 0
+    hud = HudTela()
+
+    # Pipeline em 2 estagios: uma thread produz os quadros (leitura da camera,
+    # resize, rastreio, HUD) enquanto a principal so faz imshow/waitKey. O
+    # imshow do GTK em 1080p custa ~20-40 ms; em paralelo com o resto o FPS
+    # passa a ser limitado pelo estagio mais lento, nao pela soma dos dois.
+    estado = {"quadro": None, "erro": None}
+    novo_quadro = threading.Event()
+    parar = threading.Event()
+
+    prof = {}
+    prof_show = {}
+    ultimo_dump = [0.0]
+    if args.dump_frames:
+        os.makedirs(args.dump_frames, exist_ok=True)
+
+    def marca(nome, t0):
+        if args.profile:
+            t1 = time.time()
+            prof[nome] = prof.get(nome, 0.0) + (t1 - t0)
+            return t1
+        return t0
+
+    def produzir():
+        try:
+            n_prof, t_prof = 0, time.time()
+            while not parar.is_set():
+                t0 = time.time()
+                bruto = ler_color(color_stream)
+                if args.dump_frames and time.time() - ultimo_dump[0] > 0.4:
+                    ultimo_dump[0] = time.time()
+                    cv2.imwrite(os.path.join(args.dump_frames, "q%05d.png" % int(ultimo_dump[0] * 10 % 100000)), bruto)
+                t0 = marca("leitura", t0)
+                cor = cv2.resize(bruto, (largura, altura), interpolation=cv2.INTER_LINEAR)
+                t0 = marca("resize", t0)
+
+                alvos = []
+                if detector:
+                    # o YOLO recebe o frame da camera (reduzido la dentro); o rastreio
+                    # por fluxo optico roda a cada frame. Caixas voltam em coordenadas
+                    # da camera e sao escaladas pra tela.
+                    detector.submit(bruto)
+                    t0 = marca("rastreio", t0)
+                    ex, ey = largura / bruto.shape[1], altura / bruto.shape[0]
+                    caixas = detector.alvos()
+                    alvos = [(i, (int(x * ex), int(y * ey), int(w * ex), int(h * ey)), idade)
+                             for (i, (x, y, w, h), idade) in caixas]
+                    distancias = None
+                    if medidor is not None:
+                        try:
+                            mapa = leitor_depth.mapa()
+                            if mapa is None:      # profundidade parada: sem distancia
+                                distancias = {i: None for (i, _, _) in caixas}
+                            else:
+                                fx, fy = mapa.shape[1] / bruto.shape[1], mapa.shape[0] / bruto.shape[0]
+                                distancias = medidor.medir(mapa, [
+                                    (i, (x * fx, y * fy, w * fx, h * fy)) for (i, (x, y, w, h), _) in caixas])
+                        except Exception as e:
+                            print(f"AVISO: falha lendo profundidade ({e})", file=sys.stderr)
+                    desenhar_alvos_hud(cor, alvos, distancias)
+                hud.desenhar(cor, len(alvos), detector is not None)
+                t0 = marca("hud", t0)
+
+                quadro = cor
+                if ouvinte is not None:
+                    quadro = compor_hud_transparente(quadro, visual_som, ouvinte, canto=args.corner)
+                if cliente_chat:
+                    quadro = desenhar_chat(quadro, cliente_chat.mensagens())
+                if transcritor:
+                    quadro = painel_texto.desenhar(
+                        quadro, transcritor.mensagens(), transcritor.estado(),
+                        conversa.conectado() if conversa else None)
+                t0 = marca("mic/chat", t0)
+                estado["quadro"] = quadro  # nao e mais alterado depois de publicado
+                novo_quadro.set()
+                if args.profile:
+                    n_prof += 1
+                    if time.time() - t_prof > 3:
+                        dt = time.time() - t_prof
+                        print("PROFILE produtor %.1f fps | %s | imshow %.1f ms/quadro" % (
+                            n_prof / dt,
+                            " ".join("%s=%.1fms" % (k, v / n_prof * 1000) for k, v in prof.items()),
+                            prof_show.get("imshow", 0.0) / max(1, prof_show.get("n", 1)) * 1000),
+                            flush=True)
+                        prof.clear(); prof_show.clear(); n_prof, t_prof = 0, time.time()
+        except Exception as e:  # repassa pra thread principal encerrar direito
+            estado["erro"] = e
+            novo_quadro.set()
+
+    produtor = threading.Thread(target=produzir, daemon=True)
+    produtor.start()
 
     try:
         while True:
-            cor = ler_color(color_stream)
-            cor = cv2.resize(cor, (largura, altura), interpolation=cv2.INTER_LINEAR)
+            novo_quadro.wait(timeout=1.0)
+            novo_quadro.clear()
+            if estado["erro"] is not None:
+                raise estado["erro"]
+            quadro = estado["quadro"]
+            if quadro is not None:
+                t_show = time.time()
+                cv2.imshow(janela, quadro)
+                if args.profile:
+                    prof_show["imshow"] = prof_show.get("imshow", 0.0) + time.time() - t_show
+                    prof_show["n"] = prof_show.get("n", 0) + 1
 
-            if detector:
-                detector.submit(cor.copy())
-                desenhar_rostos(cor, detector.boxes())
+                if primeiro_frame:
+                    if args.vitrine:
+                        tela_w, tela_h = tamanho_tela_cheia()
+                        if args.vitrine_canto == "tl":
+                            x, y = 0, 0
+                        elif args.vitrine_canto == "tr":
+                            x, y = tela_w - largura, 0
+                        elif args.vitrine_canto == "bl":
+                            x, y = 0, tela_h - altura
+                        else:  # "br"
+                            x, y = tela_w - largura, tela_h - altura
+                        cv2.moveWindow(janela, x, y)
+                    primeiro_frame = False
 
-            quadro = cor
-            if ouvinte is not None:
-                quadro = compor_hud_transparente(quadro, visual_som, ouvinte, canto=args.corner)
-            if cliente_chat:
-                quadro = desenhar_chat(quadro, cliente_chat.mensagens())
-            cv2.imshow(janela, quadro)
-
-            if primeiro_frame:
-                if args.vitrine:
-                    tela_w, tela_h = tamanho_tela_cheia()
-                    if args.vitrine_canto == "tl":
-                        x, y = 0, 0
-                    elif args.vitrine_canto == "tr":
-                        x, y = tela_w - largura, 0
-                    elif args.vitrine_canto == "bl":
-                        x, y = 0, tela_h - altura
-                    else:  # "br"
-                        x, y = tela_w - largura, tela_h - altura
-                    cv2.moveWindow(janela, x, y)
-                elif not args.windowed:
-                    cv2.setWindowProperty(janela, cv2.WND_PROP_FULLSCREEN,
-                                           cv2.WINDOW_FULLSCREEN)
-                primeiro_frame = False
+                # O Unity ignora o WND_PROP_FULLSCREEN do OpenCV/GTK (a janela fica
+                # so maximizada, com moldura). Pede tela cheia de verdade ao WM via
+                # libwnck, num processo do python do sistema (que tem o `gi`).
+                if not args.windowed and not args.vitrine and quadros == 10:
+                    _tela_cheia_wnck(janela)
+                quadros += 1
 
             tecla = cv2.waitKey(1) & 0xFF
             if tecla in (ord("q"), 27):  # 'q' ou ESC
                 break
     finally:
+        parar.set()
+        produtor.join(timeout=2)
         if detector:
             detector.parar()
         if cliente_chat:
             cliente_chat.parar()
+        if conversa:
+            conversa.parar()
+        if transcritor:
+            transcritor.parar()
         if ouvinte:
             ouvinte.parar()
-        parar_sensor(color_stream)
+        if leitor_depth:
+            leitor_depth.parar()
+        parar_sensor(color_stream, depth_stream)
         cv2.destroyAllWindows()
 
 
