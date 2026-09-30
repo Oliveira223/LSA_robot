@@ -291,6 +291,32 @@ class Terminal(cmd.Cmd):
         finally:
             parar.set()
 
+    def do_shush(self, arg):
+        """shush - interrompe a fala do robo AGORA.
+
+        Corta o audio que esta tocando, descarta as frases que ainda estavam na fila e ignora o
+        resto do audio daquela resposta (o texto continua aparecendo). Serve quando o robo
+        comeca a responder algo que nao devia, ou esta falando demais. Nao desliga a conversa:
+        a proxima pergunta e respondida normalmente (pra isso, use `chat off`)."""
+        return self._remoto("shush", arg)
+
+    def do_chat(self, arg):
+        """chat [on|off] - liga/desliga a CONVERSA POR VOZ.
+
+          chat         mostra se esta ligada
+          chat off     o microfone continua transcrevendo (o texto aparece na tela), mas o que
+                       ele ouve NAO vai mais ao cerebro: o robo para de responder ao ambiente.
+                       Tambem corta a fala em andamento.
+          chat on      volta a responder ao que o microfone ouve
+
+        `type` e `say` continuam funcionando com a conversa desligada (digitar e pedir
+        resposta de proposito). Abrir ja desligada: start --chat-off. Vale so enquanto o app
+        roda. Diferente de `shush`, que so corta a fala do momento."""
+        return self._remoto("chat", arg)
+
+    def complete_chat(self, texto, linha, inicio, fim):
+        return [o for o in ("on", "off") if o.startswith(texto)]
+
     def do_listen(self, arg):
         """listen - mostra no terminal, ao vivo, o que o microfone entende (e as respostas do robo).
 
@@ -330,6 +356,7 @@ class Terminal(cmd.Cmd):
         microfone e transcricao. Flags vao direto pro programa, por exemplo:
           start --saudar          abre com a saudacao ja ligada
           start --no-mic          sem microfone (da pra usar type/say)
+          start --chat-off        abre com a conversa por voz desligada (veja `help chat`)
           start --windowed        janela normal em vez de tela cheia
         Antes de abrir ele ESPERA a PrimeSense aparecer no USB (ate 60 s), mostrando
         "Procurando a PrimeSense no USB... tentativa N": se o cabo estiver desplugado, basta
@@ -392,6 +419,8 @@ Conversar com o robo
   type [pergunta]     escreve pro robo como se voce tivesse falado; ele responde (texto e voz).
                       Sem pergunta: modo type> (chat)
   listen              mostra ao vivo o que o microfone ouve
+  shush               interrompe a fala do robo agora
+  chat [on|off]       liga/desliga a conversa por voz (o que o microfone ouve vai ao cerebro?)
 
 Ver e ajustar (sem reiniciar nada)
   status              estado de camera, profundidade, rostos, microfone, cerebro e voz

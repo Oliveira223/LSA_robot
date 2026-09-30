@@ -37,6 +37,8 @@ Permite alternar entre os sensores de profundidade, infravermelho e cor, exibir 
 | `greet [on\|off\|text <frase>\|dist <min> <max>\|interval <s>]` | liga/desliga e ajusta o "bom dia" por proximidade, ao vivo |
 | `say [texto]` | o robô fala o texto com a **voz dele** (Piper, a mesma das respostas). Sem texto abre o prompt `say> `, que fala cada linha digitada |
 | `type [pergunta]` | digita para o robô como se tivesse sido falado (vai ao cérebro). Com a pergunta, envia e mostra a resposta. Sem argumento abre o prompt `type> `, onde tudo que você digita vai ao cérebro e as respostas aparecem |
+| `shush` | interrompe a fala do robô agora (corta o áudio e descarta o resto da resposta) |
+| `chat [on\|off]` | liga/desliga a conversa por voz: desligada, o microfone só transcreve e o robô não responde ao ambiente (`type` e `say` continuam funcionando). `--chat-off` abre já desligada |
 | `listen` | mostra ao vivo o que o microfone ouve e as respostas do robô (Ctrl+C sai) |
 | `restart mic` | recria o ouvinte do microfone dentro do app e confere se chegou áudio; se o áudio USB da PrimeSense travou, avisa que só um replug resolve |
 | `start [flags]`, `restart [flags]`, `stop` | abrem/reiniciam/encerram o app pelo `camera-simples` (SIGTERM primeiro, sem reset USB) |
