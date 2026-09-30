@@ -331,6 +331,9 @@ class Terminal(cmd.Cmd):
           start --saudar          abre com a saudacao ja ligada
           start --no-mic          sem microfone (da pra usar type/say)
           start --windowed        janela normal em vez de tela cheia
+        Antes de abrir ele ESPERA a PrimeSense aparecer no USB (ate 60 s), mostrando
+        "Procurando a PrimeSense no USB... tentativa N": se o cabo estiver desplugado, basta
+        plugar e ele segue sozinho. Se nao aparecer, falha com instrucoes (replugar o cabo).
         Nao reinicia nada nem mexe no USB. Para reabrir um app ja rodando, use `restart`."""
         return launcher("start", *arg.split())
 

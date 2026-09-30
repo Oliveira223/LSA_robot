@@ -9,6 +9,12 @@
 #   ./camera-simples start      so abre (nao mexe em processo/USB antes)
 #   ./camera-simples stop       fecha e libera o sensor
 #   ./camera-simples status     mostra se esta rodando
+#   ./camera-simples usb [s]    so espera a PrimeSense aparecer no USB (padrao 60 s)
+#
+# Antes de abrir o app ele ESPERA a PrimeSense aparecer no USB (e ficar estavel
+# por 2 s), mostrando "Procurando a PrimeSense no USB... tentativa N" — assim um
+# cabo desplugado/replugando nao vira "sensor nao abriu" depois de 25 s de silencio.
+# CAMERA_ESPERA_USB_S=90 muda o tempo maximo de espera.
 #
 # Qualquer argumento extra e repassado pro Camera_Simples.py, ex:
 #   ./camera-simples start --no-faces      desliga a deteccao de rosto
@@ -32,8 +38,10 @@ APPDIR="$HOME/dev/LSA_robot/experiments/camera_prime_sense"
 PY="$APPDIR/venv/bin/python"
 APP="$APPDIR/Camera_Simples.py"
 LOG="/tmp/camera-simples.log"
-USB_VENDOR="1d27"
+USB_VENDOR="${CAMERA_USB_VENDOR:-1d27}"      # so pra testes: outro id simula a camera ausente
 USB_PRODUCT="0601"
+ESPERA_USB_S="${CAMERA_ESPERA_USB_S:-60}"    # quanto esperar a PrimeSense aparecer no USB
+ESTAVEL_USB_S=2                              # segundos seguidos presente pra valer como estavel
 
 for f in "$HOME/.Xauthority" "/run/user/$(id -u)/gdm/Xauthority"; do
     [ -f "$f" ] && { export XAUTHORITY="$f"; break; }
@@ -51,6 +59,43 @@ achar_dispositivo_usb() {
             [ -n "$bus" ] && [ -n "$dev" ] && printf '/dev/bus/usb/%03d/%03d\n' "$bus" "$dev" && return 0
         fi
     done
+    return 1
+}
+
+# Progresso: em terminal sobrescreve a mesma linha; fora dele (log, pipe) imprime
+# uma linha nova a cada ~5 s. `fim_progresso` apaga a linha de progresso.
+progresso() {   # progresso <texto> <segundos decorridos>
+    if [ -t 1 ]; then printf '\r\033[K%s' "$1"
+    elif [ $(( $2 % 5 )) -eq 0 ]; then echo "$1"; fi
+}
+fim_progresso() { if [ -t 1 ]; then printf '\r\033[K'; fi; }
+
+# Espera a PrimeSense aparecer no USB e ficar ESTAVEL_USB_S segundos seguidos
+# (ela as vezes aparece e cai). Devolve 1 se nao aparecer em `limite` segundos.
+esperar_usb() {   # esperar_usb [limite em segundos]
+    local limite="${1:-$ESPERA_USB_S}" inicio=$SECONDS tentativa=0 seguidos=0 dec texto
+    while :; do
+        dec=$((SECONDS - inicio))
+        if achar_dispositivo_usb >/dev/null; then
+            seguidos=$((seguidos + 1))
+            if [ "$seguidos" -ge "$ESTAVEL_USB_S" ]; then
+                fim_progresso
+                echo "PrimeSense encontrada no USB."
+                return 0
+            fi
+            texto="PrimeSense detectada no USB, confirmando..."
+        else
+            seguidos=0
+            texto="Procurando a PrimeSense no USB... tentativa $((tentativa + 1)) (${dec}s/${limite}s) - se nao aparecer, replugue o cabo"
+        fi
+        [ "$dec" -ge "$limite" ] && break
+        tentativa=$((tentativa + 1))
+        progresso "$texto" "$dec"
+        sleep 1
+    done
+    fim_progresso
+    echo "ERRO: a PrimeSense nao apareceu no USB em ${limite}s." >&2
+    echo "      Replugue o cabo (10 s desplugado, direto numa porta da Jetson, sem hub) e tente de novo." >&2
     return 1
 }
 
@@ -110,13 +155,15 @@ parar() {
 # Espera o log mostrar que o sensor abriu de verdade ("Cor:" e' impresso depois
 # de abrir + configurar o stream). Devolve 1 se o processo morreu ou travou
 # (sensor pendurado nao imprime nada e fica com 0% de CPU).
-esperar_sensor() {
+esperar_sensor() {   # esperar_sensor <numero da tentativa>
     local i
     for i in $(seq 1 25); do
         sleep 1
-        pgrep -f "$APP" >/dev/null 2>&1 || return 1
-        grep -q "^Cor:" "$LOG" 2>/dev/null && return 0
+        pgrep -f "$APP" >/dev/null 2>&1 || { fim_progresso; return 1; }
+        grep -q "^Cor:" "$LOG" 2>/dev/null && { fim_progresso; return 0; }
+        progresso "Abrindo o sensor (tentativa $1/3)... ${i}s/25s" "$i"
     done
+    fim_progresso
     return 1
 }
 
@@ -130,8 +177,11 @@ iniciar() {
         return 0
     fi
     cd "$APPDIR" || exit 1
+    esperar_usb || exit 1
     local tentativa
     for tentativa in 1 2 3; do
+        # depois de uma falha o sensor passou por reset: espera ele reaparecer
+        [ "$tentativa" -gt 1 ] && { esperar_usb 30 || exit 1; }
         # O PulseAudio (autostart no login) fica sondando a interface de audio
         # da PrimeSense e trava (usb_set_interface -110 no dmesg), o que deixa
         # o OpenNI2 pendurado ao abrir o video. Ele renasce sozinho quando o
@@ -139,7 +189,7 @@ iniciar() {
         pkill -9 pulseaudio 2>/dev/null
         nohup "$PY" -u "$APP" "$@" >"$LOG" 2>&1 &
         disown
-        if esperar_sensor; then
+        if esperar_sensor "$tentativa"; then
             echo "Tela aberta na Jetson (DISPLAY $DISP). Log: $LOG"
             return 0
         fi
@@ -158,6 +208,9 @@ case "${1:-}" in
         ;;
     status)
         status
+        ;;
+    usb)
+        esperar_usb "${2:-}"
         ;;
     start)
         shift
