@@ -180,7 +180,10 @@ def registrar_comandos(servidor, args, saudador, mic, transcritor, conversa,
         return "conversa por voz: " + ("LIGADA" if transcritor.conversa_ativa else
                                        "DESLIGADA (o microfone so transcreve; `type` ainda responde)")
 
-    def cmd_shush(_arg):
+    def cmd_shush(arg):
+        if arg:
+            raise ValueError("shush nao tem argumentos: ele so corta a fala de agora (a proxima "
+                             "resposta toca normal). Pra desligar a conversa use: chat off")
         if conversa is None:
             raise ValueError("nao ha conversa com o cerebro (--no-cerebro)")
         if conversa.interromper():

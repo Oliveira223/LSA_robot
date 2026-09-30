@@ -122,7 +122,8 @@ class ClienteConversa:
         self._suporta_falar = False          # servidor novo anuncia no hello
         self._fim = threading.Event()        # setado quando chega o TEXTO vazio (fim da resposta)
         self._aguardando_desde = 0.0         # !=0 enquanto espera o fim de uma resposta
-        self._descartar = False              # `interromper`: ignora o audio ate o fim da resposta
+        self._descartar_ate = 0.0            # `interromper`: ignora o audio ate o fim da resposta
+                                             # (ou TIMEOUT_RESPOSTA_S, se o fim nunca chegar)
         self._tocador = None                 # paplay em andamento (pra poder interromper)
         self._envio = queue.Queue()
         self._reproducao = queue.Queue()
@@ -150,7 +151,7 @@ class ClienteConversa:
         descartadas = 0
         with self._lock:
             if self.aguardando():        # so ha o que descartar se a resposta ainda esta chegando
-                self._descartar = True
+                self._descartar_ate = time.time() + TIMEOUT_RESPOSTA_S
             while True:
                 try:
                     self._reproducao.get_nowait()
@@ -166,7 +167,7 @@ class ClienteConversa:
 
     def descartando(self):
         """True se o audio do resto da resposta em curso esta sendo ignorado (apos interromper)."""
-        return self._descartar
+        return time.time() < self._descartar_ate
 
     def suporta_falar(self):
         return self._conectado and self._suporta_falar
@@ -183,7 +184,7 @@ class ClienteConversa:
         self._aguardando_desde = time.time()
         self._envio.put(PREFIXO_FALAR + texto)
         if not self._fim.wait(timeout):
-            self._descartar = True       # se a fala chegar atrasada, nao toca por cima de outra voz
+            self._descartar_ate = time.time() + TIMEOUT_RESPOSTA_S   # fala atrasada nao toca por cima
             return False, "a Jetson 1 nao respondeu em %.0f s" % timeout
         limite = time.time() + 60.0
         while self.falando() and time.time() < limite:
@@ -220,6 +221,7 @@ class ClienteConversa:
                 self._sock = s
             self._suporta_falar = False
             self._aguardando_desde = 0.0
+            self._descartar_ate = 0.0              # conexao nova: nada pendente pra descartar
             self._conectado = True
             print("[conversa] conectado em %s:%d" % (self._host, self._porta), flush=True)
             try:
@@ -251,10 +253,10 @@ class ClienteConversa:
                     self._nova_bolha("robo", texto)
                 else:                  # texto vazio = fim da resposta
                     self._aguardando_desde = 0.0
-                    self._descartar = False
+                    self._descartar_ate = 0.0      # a resposta acabou: a proxima toca normal
                     self._fim.set()
             elif msg.tipo == AUDIO and msg.dados:
-                if self._descartar:
+                if self.descartando():
                     print("[conversa] audio descartado (interrompido)", flush=True)
                     continue
                 print("[conversa] audio recebido (%d bytes)" % len(msg.dados), flush=True)
