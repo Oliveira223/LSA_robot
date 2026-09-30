@@ -28,3 +28,6 @@ audio_temp/
 
 .claude/
 graphify-out/
+
+# Pesos do YOLO (baixados, ~230 MB)
+model-weights/
