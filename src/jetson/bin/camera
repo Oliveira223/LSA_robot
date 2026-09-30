@@ -111,8 +111,16 @@ def _ler_linha(prompt):
         return None
 
 
+def _limpar_doc(doc):
+    """Tira o recuo comum das linhas de uma docstring."""
+    linhas = doc.strip("\n").splitlines()
+    resto = [l for l in linhas[1:] if l.strip()]
+    recuo = min((len(l) - len(l.lstrip()) for l in resto), default=0)
+    return "\n".join([linhas[0].strip()] + [l[recuo:] if l.strip() else "" for l in linhas[1:]])
+
+
 class Terminal(cmd.Cmd):
-    intro = "Controle da camera. 'help' lista os comandos, 'exit' (ou Ctrl+D) fecha."
+    intro = "Controle da camera. 'help' explica os comandos, 'exit' (ou Ctrl+D) fecha."
     prompt = "camera> "
     doc_header = "Comandos (digite 'help <comando>' pra detalhes):"
     ruler = ""
@@ -139,13 +147,32 @@ class Terminal(cmd.Cmd):
         return None if ok else 1
 
     def do_status(self, arg):
-        """status - estado do app: camera, profundidade, rostos, microfone, cerebro, voz, saudacao."""
+        """status - mostra o estado de cada parte do app, numa olhada.
+
+        Linhas: app (pid e ha quanto tempo roda), profundidade (se o sensor manda
+        quadros; sem isso nao ha distancia), rostos (quantos no quadro agora), microfone
+        (ok / SEM AUDIO / OFFLINE, com a causa provavel), transcricao, cerebro (Jetson 1
+        conectada?), voz (robo = Piper da Jetson 1; local = servidor antigo) e saudacao.
+
+        Use primeiro quando algo nao responde: ele diz o que esta quebrado e o que fazer.
+        Nao altera nada."""
         return self._remoto("status", arg)
 
     def do_greet(self, arg):
         """greet [on|off|text <frase>|dist <min> <max>|interval <s>]
-        Sem argumento mostra o estado. Liga/desliga o "bom dia" quando um rosto
-        chega perto, e ajusta frase, faixa de distancia (m) e intervalo (s)."""
+
+        Controla a saudacao: quando um rosto fica entre <min> e <max> metros por uns
+        5 quadros seguidos, o robo fala a frase ("Bom dia" por padrao). Precisa da
+        profundidade funcionando (sem ela nao ha distancia).
+
+          greet                  mostra o estado atual
+          greet on / greet off   liga / desliga (comeca desligada)
+          greet text Oi, tudo bem?   muda a frase
+          greet dist 0.8 1.2     faixa de distancia em metros (padrao 0.8 a 1.2)
+          greet interval 20      segundos minimos entre duas saudacoes (padrao 20)
+
+        Vale so enquanto o app roda: apos `restart` volta ao padrao (desligada),
+        a menos que voce abra com `restart --saudar`."""
         partes = arg.split(None, 1)
         if partes and partes[0] in SUBCOMANDOS_GREET:
             partes[0] = SUBCOMANDOS_GREET[partes[0]]
@@ -156,9 +183,17 @@ class Terminal(cmd.Cmd):
         return [o for o in ("on", "off", "text", "dist", "interval") if o.startswith(texto)]
 
     def do_say(self, arg):
-        """say [texto] - o robo fala o texto na caixa, com a voz dele (a mesma das respostas).
-        Sem texto abre o prompt 'say> ': cada linha que voce digitar e falada.
-        '/exit' ou Ctrl+D volta."""
+        """say [texto] - faz o robo FALAR um texto, sem passar pelo cerebro.
+
+          say bom dia            fala uma vez e volta
+          say                    abre o modo say> : cada linha digitada e falada;
+                                 "/exit" ou Ctrl+D volta ao camera>
+
+        A voz e a do robo (Piper, sintetizada na Jetson 1 e tocada aqui na caixa HDMI);
+        e a mesma das respostas. Se a Jetson 1 estiver fora ou com o servidor antigo,
+        o comando avisa e tenta uma voz local (robotica). O microfone fica mudo enquanto
+        o robo fala, pra ele nao ouvir a propria voz.
+        Diferente de `type`: `say` repete o que voce escreveu; `type` PERGUNTA."""
         if arg.strip():
             return self._remoto("falar", arg, TIMEOUT_FALAR_S)
         print("Modo say: cada linha e falada pelo robo. '/exit' ou Ctrl+D sai.")
@@ -170,10 +205,16 @@ class Terminal(cmd.Cmd):
                 self._remoto("falar", linha, TIMEOUT_FALAR_S)
 
     def do_type(self, arg):
-        """type [pergunta] - digita pra o robo como se tivesse sido falado: vai ao cerebro
-        (Jetson 1), que responde em texto e voz. Com a pergunta, envia e mostra a resposta.
-        Sem argumento abre o prompt 'type> ': tudo que voce digitar vai ao cerebro e as
-        respostas aparecem ali. '/exit' ou Ctrl+D volta."""
+        """type [pergunta] - escreve pro robo como se voce tivesse FALADO. Vai ao cerebro
+        (IA na Jetson 1), que responde em texto e voz. Serve pra conversar sem microfone.
+
+          type qual e o seu nome     envia, mostra a resposta ("robot: ...") e volta
+          type                       abre o modo type> : tudo que voce digitar vai ao cerebro
+                                     e as respostas aparecem ali; "/exit" ou Ctrl+D volta
+
+        A pergunta tambem aparece na janela de texto da tela do robo. Se a Jetson 1
+        estiver desconectada, avisa que nao havera resposta.
+        Diferente de `say`: `type` espera uma RESPOSTA; `say` so repete o texto."""
         if arg.strip():
             return self._perguntar(arg.strip())
         return self._conversar()
@@ -251,8 +292,12 @@ class Terminal(cmd.Cmd):
             parar.set()
 
     def do_listen(self, arg):
-        """listen - mostra ao vivo o que o microfone ouve (e as respostas do robo).
-        Ctrl+C volta ao prompt."""
+        """listen - mostra no terminal, ao vivo, o que o microfone entende (e as respostas do robo).
+
+        Cada frase falada aparece como "you: ..." depois que voce termina de falar; enquanto
+        fala, uma linha "... texto parcial" vai se formando. Respostas do cerebro aparecem
+        como "robot: ...". Ctrl+C volta ao prompt (o app continua).
+        Se o microfone nao estiver ok, avisa antes de comecar. So observa, nao altera nada."""
         ok, msg = pedir("status")
         if ok:
             for linha in msg.splitlines():
@@ -279,18 +324,28 @@ class Terminal(cmd.Cmd):
 
     # ── mexem no processo ──────────────────────────────────────────────
     def do_start(self, arg):
-        """start [flags] - abre o app se nao estiver rodando (as flags vao pro
-        Camera_Simples.py, ex.: start --saudar abre com a saudacao ligada)."""
+        """start [flags] - abre o app da camera se ele nao estiver rodando (nao faz nada se ja estiver).
+
+        Abre a janela em tela cheia na Jetson, liga camera, profundidade, deteccao de rosto,
+        microfone e transcricao. Flags vao direto pro programa, por exemplo:
+          start --saudar          abre com a saudacao ja ligada
+          start --no-mic          sem microfone (da pra usar type/say)
+          start --windowed        janela normal em vez de tela cheia
+        Nao reinicia nada nem mexe no USB. Para reabrir um app ja rodando, use `restart`."""
         return launcher("start", *arg.split())
 
     def do_restart(self, arg):
-        """restart mic - recria o ouvinte do microfone DENTRO do app, sem reabri-lo, e
-        confere se chegou audio (se o audio USB da PrimeSense travou, avisa: so replug resolve).
+        """restart mic - recria o ouvinte do microfone DENTRO do app, sem reabri-lo, e confere se
+        chegou audio de verdade. Se o audio USB da PrimeSense travou, diz isso (so replug do
+        cabo resolve; nesse caso use type/say enquanto isso).
 
-        restart [app|camera] [flags] - encerra o app do jeito limpo (SIGTERM, sem
-        reset USB) e abre de novo. "camera" e "app" sao a mesma coisa: reabrir o
-        sensor dentro do processo trava o OpenNI2. Ao reabrir, a saudacao volta
-        ao padrao (desligada), a menos que voce passe --saudar."""
+        restart [app|camera] [flags] - encerra o app do jeito limpo (SIGTERM, ~5 s, sem reset
+        USB) e abre de novo. "app" e "camera" sao a mesma coisa: reabrir o sensor dentro do
+        processo trava o OpenNI2. A saudacao volta ao padrao (desligada), a menos que voce
+        passe --saudar.
+
+        Cuidado: reiniciar varias vezes seguidas pode travar o audio do sensor; prefira os
+        comandos ao vivo (greet, say, type), que nao precisam reiniciar."""
         partes = arg.split()
         if partes and partes[0] == "mic":
             return self._remoto("reiniciar_mic", "")
@@ -302,12 +357,16 @@ class Terminal(cmd.Cmd):
         return [o for o in ("mic", "app", "camera") if o.startswith(texto)]
 
     def do_stop(self, arg):
-        """stop - encerra o app (SIGTERM, sem reset USB)."""
+        """stop - encerra o app da camera do jeito limpo (SIGTERM, sem reset USB). Para abrir de novo: start."""
         return launcher("stop")
 
     def do_log(self, arg):
-        """log [all] - acompanha o log do app ao vivo (Ctrl+C volta ao prompt).
-        Sem "all" esconde as linhas de ruido (quadros de profundidade e falas descartadas)."""
+        """log [all] - acompanha o log do app ao vivo (equivale a um tail -f). Ctrl+C volta.
+
+        Por padrao esconde o ruido (uma linha "depth:" a cada 5 s e falas descartadas pelo
+        reconhecedor). `log all` mostra tudo. Mostra erros, avisos e eventos como
+        "[saudacao] falando ..." e "[conversa] conectado ...". Util em um segundo terminal
+        enquanto voce usa o primeiro."""
         tudo = arg.strip() in ("all", "tudo")
         if not os.path.exists(LOG):
             print("erro: sem log em %s (o app ja foi aberto?)" % LOG)
@@ -324,9 +383,45 @@ class Terminal(cmd.Cmd):
             proc.terminate()
         return None
 
+    VISAO_GERAL = """\
+Conversar com o robo
+  say [texto]         o robo FALA o texto (voz dele). Sem texto: modo say> (uma frase por linha)
+  type [pergunta]     escreve pro robo como se voce tivesse falado; ele responde (texto e voz).
+                      Sem pergunta: modo type> (chat)
+  listen              mostra ao vivo o que o microfone ouve
+
+Ver e ajustar (sem reiniciar nada)
+  status              estado de camera, profundidade, rostos, microfone, cerebro e voz
+  greet [...]         liga/desliga e ajusta o "bom dia" quando um rosto chega perto
+
+O app da camera
+  start [flags]       abre o app         stop         encerra o app
+  restart [...]       reinicia o app, ou `restart mic` so o microfone
+  log [all]           acompanha o log do app ao vivo
+
+exit                  fecha este terminal (o app continua rodando)
+
+Sem argumento, `say` e `type` abrem um prompt proprio; com argumento fazem a acao uma vez.
+Digite 'help <comando>' pra detalhes e exemplos (ex.: help greet).
+"""
+
+    def do_help(self, arg):
+        """help [comando] - esta ajuda; com um comando mostra os detalhes dele."""
+        nome = arg.strip().split()[0] if arg.strip() else ""
+        nome = self._ALIASES.get(nome, nome)
+        if not nome:
+            print(self.VISAO_GERAL)
+            return None
+        funcao = getattr(self, "do_" + nome, None)
+        if funcao is None or not funcao.__doc__:
+            print("comando desconhecido: %s  (digite 'help')" % nome)
+            return 1
+        print(_limpar_doc(funcao.__doc__))
+        return None
+
     # ── terminal ───────────────────────────────────────────────────────
     def do_exit(self, arg):
-        """exit - fecha este terminal (o app continua rodando)."""
+        """exit - fecha este terminal (Ctrl+D tambem). O app da camera continua rodando."""
         return True
 
     do_quit = do_exit
