@@ -22,6 +22,7 @@ import threading
 
 SOCKET = "/tmp/camera.sock"
 TIMEOUT_CONEXAO_S = 60.0      # `falar` pode levar alguns segundos
+SEM_LOG = ("status", "ouvir")  # o terminal `camera` consulta isso o tempo todo
 
 
 class ServidorControle:
@@ -89,9 +90,16 @@ class ServidorControle:
         funcao = self._handlers.get(nome)
         if funcao is None:
             return {"ok": False, "msg": "comando desconhecido: %s" % nome}
+        quieto = nome in SEM_LOG          # consultas repetidas (status/ouvir) nao poluem o log
+        pedido = "%s%s" % (nome, (" " + arg[:60]) if arg else "")
         try:
-            return {"ok": True, "msg": funcao(arg)}
+            msg = funcao(arg)
+            if not quieto:
+                print("[controle] %s -> ok" % pedido, flush=True)
+            return {"ok": True, "msg": msg}
         except ValueError as e:
+            if not quieto:
+                print("[controle] %s -> AVISO: %s" % (pedido, str(e)[:100]), flush=True)
             return {"ok": False, "msg": str(e)}
         except Exception as e:   # um comando com bug nao pode derrubar o app
             print("[controle] %s falhou: %r" % (nome, e), flush=True)

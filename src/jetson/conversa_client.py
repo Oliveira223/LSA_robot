@@ -216,6 +216,7 @@ class ClienteConversa:
         self._envio.put(texto)
 
     def _nova_bolha(self, autor, texto):
+        print("[conversa] %s: %s" % (autor, texto), flush=True)
         if self._ao_mensagem:
             self._ao_mensagem(autor, texto)
 

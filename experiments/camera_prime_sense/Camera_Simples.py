@@ -32,6 +32,9 @@ import threading
 import time
 import types
 
+import camera_log
+camera_log.instalar()          # ja aqui: os avisos de import tambem saem com data/hora e nivel
+
 import cv2
 import numpy as np
 from primesense import openni2
@@ -556,6 +559,8 @@ def main():
     args = ap.parse_args()
     if args.espera:
         return tela_espera()
+    print("[app] iniciado (pid %d, args: %s)" % (os.getpid(), " ".join(sys.argv[1:]) or "nenhum"),
+          flush=True)
 
     detector = None if args.no_faces else criar_detector_rosto(args.face_size, args.face_conf)
 
@@ -817,6 +822,7 @@ def main():
             if tecla in (ord("q"), 27):  # 'q' ou ESC
                 break
     finally:
+        print("[app] encerrando", flush=True)
         parar.set()
         servidor.parar()
         produtor.join(timeout=2)
