@@ -129,6 +129,7 @@ class ClienteTranscricao:
         self._estado = "carregando"
         self._parcial = ""
         self._conversa = None      # ClienteConversa (Jetson 1), opcional
+        self._mudo_extra = None
         self._estava_mudo = False
         self._rodando = True
         self._proc = None
@@ -158,6 +159,11 @@ class ClienteTranscricao:
         transcrita e enviada a ele e o microfone fica mudo enquanto o robo fala."""
         self._conversa = conversa
 
+    def definir_mudo_extra(self, funcao):
+        """funcao() -> True enquanto o robo fala por outro caminho (ex.: a
+        saudacao por proximidade), pra o mic nao transcrever a propria voz."""
+        self._mudo_extra = funcao
+
     def adicionar(self, autor, texto):
         """Acrescenta uma bolha ("usuario" ou "robo") a conversa mostrada na tela."""
         with self._lock:
@@ -181,7 +187,8 @@ class ClienteTranscricao:
         # roda na thread do mic: so enfileira
         if self._estado != "pronto":
             return
-        if self._conversa is not None and self._conversa.falando():
+        if ((self._conversa is not None and self._conversa.falando())
+                or (self._mudo_extra is not None and self._mudo_extra())):
             # o robo esta falando: o mic ouviria a propria voz dele
             if not self._estava_mudo:
                 self._estava_mudo = True

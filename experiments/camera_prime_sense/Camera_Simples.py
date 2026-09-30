@@ -39,6 +39,8 @@ from camera_utils import (HUD_AMARELO, HUD_CIANO, HudTela, MedidorDistancia,
                           configurar_cor, configurar_depth, criar_detector_rosto,
                           desenhar_alvos_hud, localizar_openni2_redist)
 
+from saudacao import Saudador
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # jetson.mic_vad (e, mais adiante, jetson.chat_client) vivem no repo
@@ -530,6 +532,17 @@ def main():
                      help="IP do PC rodando pc.server_voz (padrao 127.0.0.1)")
     ap.add_argument("--chat-port", type=int, default=5000,
                      help="porta do pc.server_voz (padrao 5000)")
+    ap.add_argument("--saudar", action="store_true",
+                     help="TESTE: fala uma saudacao quando um rosto chega perto "
+                          "(precisa da profundidade e da deteccao de rosto ligadas)")
+    ap.add_argument("--saudar-dist-min", type=float, default=0.8, metavar="M",
+                     help="distancia minima em metros pra saudar (padrao 0.8)")
+    ap.add_argument("--saudar-dist-max", type=float, default=1.2, metavar="M",
+                     help="distancia maxima em metros pra saudar (padrao 1.2)")
+    ap.add_argument("--saudar-texto", default="Bom dia",
+                     help="frase falada na saudacao (padrao 'Bom dia')")
+    ap.add_argument("--saudar-intervalo", type=float, default=20.0, metavar="S",
+                     help="segundos minimos entre duas saudacoes (padrao 20)")
     ap.add_argument("--dump-frames", metavar="DIR", default=None,
                      help="salva um quadro cru da camera a cada 0.4 s em DIR (pra avaliar detectores offline)")
     ap.add_argument("--profile", action="store_true",
@@ -598,6 +611,17 @@ def main():
             except ErroDeTranscricao as e:
                 print(f"AVISO: transcricao indisponivel ({e}); seguindo sem janela de texto.",
                       file=sys.stderr)
+
+    saudador = None
+    if args.saudar:
+        if detector is None or medidor is None:
+            print("AVISO: --saudar precisa de deteccao de rosto e profundidade "
+                  "(sem --no-faces/--no-distancia); saudacao desligada.", file=sys.stderr)
+        else:
+            saudador = Saudador(args.saudar_texto, args.saudar_dist_min, args.saudar_dist_max,
+                               args.saudar_intervalo)
+            if transcritor is not None:
+                transcritor.definir_mudo_extra(saudador.falando)
 
     cliente_chat = None
     if args.stt == "pc" and ClienteChat is not None:
@@ -690,6 +714,8 @@ def main():
                                     (i, (x * fx, y * fy, w * fx, h * fy)) for (i, (x, y, w, h), _) in caixas])
                         except Exception as e:
                             print(f"AVISO: falha lendo profundidade ({e})", file=sys.stderr)
+                    if saudador is not None:
+                        saudador.atualizar(distancias)
                     desenhar_alvos_hud(cor, alvos, distancias)
                 hud.desenhar(cor, len(alvos), detector is not None)
                 t0 = marca("hud", t0)
