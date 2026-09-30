@@ -6,7 +6,8 @@ camera - terminal de controle do app da PrimeSense (Camera_Simples.py).
     camera <comando> ...   roda um comando so e sai (ex.: camera saudar on)
 
 Comandos que falam com o app em execucao (pelo socket /tmp/camera.sock, sem
-reiniciar nada):  status, saudar, falar, digitar.
+reiniciar nada):  status, saudar, falar, digitar, transcrever, conversar,
+reiniciar mic.
 Comandos que mexem no processo (funcionam mesmo com o app travado, usam o
 launcher camera-simples):  iniciar, reiniciar, parar, log.
 
@@ -18,12 +19,21 @@ import os
 import socket
 import subprocess
 import sys
+import threading
+import time
+
+try:
+    import readline      # so pra o input() ter edicao de linha e historico
+except ImportError:
+    readline = None
 
 AQUI = os.path.dirname(os.path.realpath(__file__))
 LAUNCHER = os.path.join(AQUI, "camera-simples")
 SOCKET = os.environ.get("CAMERA_SOCKET", "/tmp/camera.sock")   # CAMERA_SOCKET so pra testes
 LOG = "/tmp/camera-simples.log"
 TIMEOUT_S = 45.0          # `falar` espera a fala terminar
+# apaga a linha atual (prompt/parcial) — so em terminal de verdade
+LIMPA = "\r\033[K" if sys.stdout.isatty() else ""
 RUIDO_DO_LOG = ("depth:", "[transcritor] descartado")
 
 
@@ -50,6 +60,48 @@ def pedir(comando, arg=""):
         return False, "falha ao falar com o app: %s" % e
     finally:
         s.close()
+
+
+def _novas(seq):
+    """(ok, dict) com as mensagens do app depois de `seq`."""
+    ok, msg = pedir("ouvir", str(seq))
+    if not ok:
+        return False, msg
+    return True, json.loads(msg)
+
+
+def _ancorar():
+    """Numero da ultima mensagem de agora (so mostra o que vier depois), ou None."""
+    ok, msg = pedir("ouvir", "-1")
+    if not ok:
+        print("erro: " + msg)
+        return None
+    return json.loads(msg)["seq"]
+
+
+def _rotulo(autor, texto):
+    return ("voce: " if autor == "usuario" else "robo: ") + texto
+
+
+def _mostrar_novas(seq, parcial=False):
+    ok, d = _novas(seq)
+    if not ok:
+        print(LIMPA + "erro: " + d)
+        return None
+    for autor, texto in d["itens"]:
+        print(LIMPA + _rotulo(autor, texto), flush=True)
+    if parcial and d["parcial"]:
+        print(LIMPA + "  ... " + d["parcial"], end="", flush=True)
+    elif parcial:
+        print(LIMPA, end="", flush=True)
+    return d["seq"]
+
+
+def _imprimir_no_prompt(linha, prompt):
+    """Imprime `linha` sem estragar o que a pessoa ja digitou no prompt."""
+    digitado = readline.get_line_buffer() if readline else ""
+    sys.stdout.write(LIMPA + linha + "\n" + prompt + digitado)
+    sys.stdout.flush()
 
 
 def launcher(*argumentos):
@@ -82,6 +134,9 @@ class Terminal(cmd.Cmd):
     def complete_saudar(self, texto, linha, inicio, fim):
         return [o for o in ("on", "off", "texto", "dist", "intervalo") if o.startswith(texto)]
 
+    def complete_reiniciar(self, texto, linha, inicio, fim):
+        return [o for o in ("mic", "app", "camera") if o.startswith(texto)]
+
     def do_falar(self, arg):
         """falar <texto> - o robo fala o texto na caixa (testa a voz)."""
         return self._remoto("falar", arg)
@@ -91,6 +146,77 @@ class Terminal(cmd.Cmd):
         tela e vai pro cerebro (Jetson 1), que responde em texto e voz."""
         return self._remoto("digitar", arg)
 
+    def do_transcrever(self, arg):
+        """transcrever - mostra ao vivo o que o microfone ouve (e as respostas do robo).
+        Ctrl+C volta ao prompt."""
+        ok, msg = pedir("status")
+        if ok:
+            for linha in msg.splitlines():
+                if linha.startswith("microfone:") and not linha.startswith("microfone: ok"):
+                    print("aviso: " + linha)
+        seq = _ancorar()
+        if seq is None:
+            return 1
+        print("Ouvindo... (Ctrl+C sai)")
+        try:
+            while True:
+                seq = _mostrar_novas(seq, parcial=True)
+                if seq is None:
+                    return 1
+                time.sleep(0.4)
+        except KeyboardInterrupt:
+            print(LIMPA, end="")
+        return None
+
+    def do_conversar(self, arg):
+        """conversar - modo de conversa por texto, sem microfone: o que voce digita vai
+        ao cerebro (Jetson 1) e as respostas do robo aparecem aqui. "/sair" ou
+        Ctrl+D volta ao prompt."""
+        seq = _ancorar()
+        if seq is None:
+            return 1
+        print("Conversa por texto (\"/sair\" ou Ctrl+D sai). O robo responde em texto e voz.")
+        pendentes = []                     # o que EU digitei, pra nao repetir o eco
+        parar = threading.Event()
+
+        def acompanhar(seq):
+            while not parar.is_set():
+                ok, d = _novas(seq)
+                if not ok:
+                    parar.wait(1.0)
+                    continue
+                seq = d["seq"]
+                for autor, texto in d["itens"]:
+                    if autor == "usuario" and texto in pendentes:
+                        pendentes.remove(texto)
+                        continue
+                    _imprimir_no_prompt(_rotulo(autor, texto), "voce> ")
+                parar.wait(0.4)
+
+        t = threading.Thread(target=acompanhar, args=(seq,), daemon=True)
+        t.start()
+        try:
+            while True:
+                try:
+                    linha = input("voce> ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    break
+                if linha == "/sair":
+                    break
+                if not linha:
+                    continue
+                pendentes.append(linha)
+                ok, msg = pedir("digitar", linha)
+                if not ok:
+                    pendentes.remove(linha)
+                    print("erro: " + msg)
+                elif "desconectada" in msg:
+                    print(msg)
+        finally:
+            parar.set()
+        return None
+
     # ── mexem no processo ──────────────────────────────────────────────
     def do_iniciar(self, arg):
         """iniciar [flags] - abre o app se nao estiver rodando (flags vao pro
@@ -98,11 +224,16 @@ class Terminal(cmd.Cmd):
         return launcher("start", *arg.split())
 
     def do_reiniciar(self, arg):
-        """reiniciar [app|camera] [flags] - encerra o app do jeito limpo (SIGTERM, sem
+        """reiniciar mic - recria o ouvinte do microfone DENTRO do app, sem reabri-lo, e
+        confere se chegou audio (se o audio USB da PrimeSense travou, avisa: so replug resolve).
+
+        reiniciar [app|camera] [flags] - encerra o app do jeito limpo (SIGTERM, sem
         reset USB) e abre de novo. "camera" e "app" sao a mesma coisa: reabrir o
         sensor dentro do processo trava o OpenNI2. Ao reabrir, a saudacao volta
         ao padrao (desligada), a menos que voce passe --saudar."""
         partes = arg.split()
+        if partes and partes[0] == "mic":
+            return self._remoto("reiniciar_mic", "")
         if partes and partes[0] in ("app", "camera"):
             partes = partes[1:]
         return launcher(*partes)

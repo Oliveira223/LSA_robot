@@ -37,10 +37,13 @@ Permite alternar entre os sensores de profundidade, infravermelho e cor, exibir 
 | `saudar [on\|off\|texto <frase>\|dist <min> <max>\|intervalo <s>]` | liga/desliga e ajusta o "bom dia" por proximidade, ao vivo |
 | `falar <texto>` | o robô fala o texto na caixa |
 | `digitar <texto>` | injeta a frase como se tivesse sido falada (vai ao cérebro) |
+| `transcrever` | mostra ao vivo o que o microfone ouve e as respostas do robô (Ctrl+C sai) |
+| `conversar` | conversa por **texto**, sem microfone: o que você digita vai ao cérebro e as respostas aparecem ali (`/sair` sai) |
+| `reiniciar mic` | recria o ouvinte do microfone dentro do app e confere se chegou áudio; se o áudio USB da PrimeSense travou, avisa que só um replug resolve |
 | `iniciar [flags]`, `reiniciar [flags]`, `parar` | abrem/reiniciam/encerram o app pelo `camera-simples` (SIGTERM primeiro, sem reset USB) |
 | `log [tudo]` | acompanha o log sem o ruído de profundidade e falas descartadas |
 
-A saudação começa desligada; `--saudar` a abre ligada. Módulos: `controle.py` (servidor do socket), `comandos.py` (os comandos), `saudacao.py`.
+A saudação começa desligada; `--saudar` a abre ligada. Módulos: `controle.py` (servidor do socket), `comandos.py` (os comandos), `saudacao.py`. Sem microfone (`--no-mic` ou mic indisponível na abertura) a janela de texto e a conversa continuam funcionando por digitação.
 
 ## Requisitos
 
