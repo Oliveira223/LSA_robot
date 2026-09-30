@@ -3,13 +3,15 @@
 camera - terminal de controle do app da PrimeSense (Camera_Simples.py).
 
     camera                 abre o terminal interativo (prompt "camera> ")
-    camera <comando> ...   roda um comando so e sai (ex.: camera saudar on)
+    camera <comando> ...   roda um comando so e sai (ex.: camera greet on)
 
 Comandos que falam com o app em execucao (pelo socket /tmp/camera.sock, sem
-reiniciar nada):  status, saudar, falar, digitar, transcrever, conversar,
-reiniciar mic.
+reiniciar nada):  status, greet, say, type, listen, restart mic.
 Comandos que mexem no processo (funcionam mesmo com o app travado, usam o
-launcher camera-simples):  iniciar, reiniciar, parar, log.
+launcher camera-simples):  start, restart, stop, log.
+
+`say` e `type` sem argumento abrem uma interface propria (um prompt que fica
+esperando o texto); com argumento fazem a acao uma vez e saem.
 
 So biblioteca padrao (Python 3.6 da Jetson).
 """
@@ -31,16 +33,21 @@ AQUI = os.path.dirname(os.path.realpath(__file__))
 LAUNCHER = os.path.join(AQUI, "camera-simples")
 SOCKET = os.environ.get("CAMERA_SOCKET", "/tmp/camera.sock")   # CAMERA_SOCKET so pra testes
 LOG = "/tmp/camera-simples.log"
-TIMEOUT_S = 45.0          # `falar` espera a fala terminar
+TIMEOUT_S = 45.0          # resposta de um comando normal
+TIMEOUT_FALAR_S = 100.0   # `say` espera a fala terminar de tocar
+TIMEOUT_RESPOSTA_S = 95.0 # `type <texto>` espera a resposta do robo
 # apaga a linha atual (prompt/parcial) — so em terminal de verdade
 LIMPA = "\r\033[K" if sys.stdout.isatty() else ""
 RUIDO_DO_LOG = ("depth:", "[transcritor] descartado")
 
+# subcomandos em ingles -> o que o app entende (o app fala portugues por dentro)
+SUBCOMANDOS_GREET = {"text": "texto", "interval": "intervalo"}
 
-def pedir(comando, arg=""):
+
+def pedir(comando, arg="", timeout=TIMEOUT_S):
     """Manda um comando ao app. Devolve (ok, mensagem)."""
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(TIMEOUT_S)
+    s.settimeout(timeout)
     try:
         s.connect(SOCKET)
         s.sendall((json.dumps({"cmd": comando, "arg": arg}) + "\n").encode("utf-8"))
@@ -53,9 +60,9 @@ def pedir(comando, arg=""):
         r = json.loads(dados.decode("utf-8"))
         return bool(r.get("ok")), str(r.get("msg", ""))
     except (FileNotFoundError, ConnectionRefusedError):
-        return False, "o app nao esta rodando (abra com: iniciar)"
+        return False, "o app nao esta rodando (abra com: start)"
     except socket.timeout:
-        return False, "o app nao respondeu a tempo (travado? tente: reiniciar)"
+        return False, "o app nao respondeu a tempo (travado? tente: restart)"
     except (OSError, ValueError) as e:
         return False, "falha ao falar com o app: %s" % e
     finally:
@@ -80,21 +87,7 @@ def _ancorar():
 
 
 def _rotulo(autor, texto):
-    return ("voce: " if autor == "usuario" else "robo: ") + texto
-
-
-def _mostrar_novas(seq, parcial=False):
-    ok, d = _novas(seq)
-    if not ok:
-        print(LIMPA + "erro: " + d)
-        return None
-    for autor, texto in d["itens"]:
-        print(LIMPA + _rotulo(autor, texto), flush=True)
-    if parcial and d["parcial"]:
-        print(LIMPA + "  ... " + d["parcial"], end="", flush=True)
-    elif parcial:
-        print(LIMPA, end="", flush=True)
-    return d["seq"]
+    return ("you: " if autor == "usuario" else "robot: ") + texto
 
 
 def _imprimir_no_prompt(linha, prompt):
@@ -109,73 +102,119 @@ def launcher(*argumentos):
     return subprocess.call([LAUNCHER] + list(argumentos))
 
 
+def _ler_linha(prompt):
+    """Uma linha do prompt, ou None em Ctrl+D/Ctrl+C."""
+    try:
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+
+
 class Terminal(cmd.Cmd):
-    intro = "Controle da camera. 'ajuda' lista os comandos, 'sair' (ou Ctrl+D) fecha."
+    intro = "Controle da camera. 'help' lista os comandos, 'exit' (ou Ctrl+D) fecha."
     prompt = "camera> "
-    doc_header = "Comandos (digite 'ajuda <comando>' pra detalhes):"
+    doc_header = "Comandos (digite 'help <comando>' pra detalhes):"
     ruler = ""
 
+    # nomes antigos em portugues: continuam funcionando, mas ficam fora do help
+    _ALIASES = {"ajuda": "help", "saudar": "greet", "falar": "say", "digitar": "type",
+                "conversar": "type", "transcrever": "listen", "iniciar": "start",
+                "reiniciar": "restart", "parar": "stop", "sair": "exit"}
+
+    def get_names(self):
+        ocultos = {"do_EOF", "do_quit"}
+        return [n for n in super().get_names() if n not in ocultos]
+
+    def onecmd(self, linha):
+        partes = linha.split(None, 1)
+        if partes and partes[0] in self._ALIASES:
+            linha = self._ALIASES[partes[0]] + (" " + partes[1] if len(partes) > 1 else "")
+        return super().onecmd(linha)
+
     # ── falam com o app ────────────────────────────────────────────────
-    def _remoto(self, comando, arg):
-        ok, msg = pedir(comando, arg)
+    def _remoto(self, comando, arg, timeout=TIMEOUT_S):
+        ok, msg = pedir(comando, arg, timeout)
         print(msg if ok else "erro: " + msg)
         return None if ok else 1
 
     def do_status(self, arg):
-        """status - estado do app: camera, profundidade, rostos, microfone, cerebro, saudacao."""
+        """status - estado do app: camera, profundidade, rostos, microfone, cerebro, voz, saudacao."""
         return self._remoto("status", arg)
 
-    def do_saudar(self, arg):
-        """saudar [on|off|texto <frase>|dist <min> <max>|intervalo <s>]
+    def do_greet(self, arg):
+        """greet [on|off|text <frase>|dist <min> <max>|interval <s>]
         Sem argumento mostra o estado. Liga/desliga o "bom dia" quando um rosto
         chega perto, e ajusta frase, faixa de distancia (m) e intervalo (s)."""
+        partes = arg.split(None, 1)
+        if partes and partes[0] in SUBCOMANDOS_GREET:
+            partes[0] = SUBCOMANDOS_GREET[partes[0]]
+            arg = " ".join(partes)
         return self._remoto("saudar", arg)
 
-    def complete_saudar(self, texto, linha, inicio, fim):
-        return [o for o in ("on", "off", "texto", "dist", "intervalo") if o.startswith(texto)]
+    def complete_greet(self, texto, linha, inicio, fim):
+        return [o for o in ("on", "off", "text", "dist", "interval") if o.startswith(texto)]
 
-    def complete_reiniciar(self, texto, linha, inicio, fim):
-        return [o for o in ("mic", "app", "camera") if o.startswith(texto)]
+    def do_say(self, arg):
+        """say [texto] - o robo fala o texto na caixa, com a voz dele (a mesma das respostas).
+        Sem texto abre o prompt 'say> ': cada linha que voce digitar e falada.
+        '/exit' ou Ctrl+D volta."""
+        if arg.strip():
+            return self._remoto("falar", arg, TIMEOUT_FALAR_S)
+        print("Modo say: cada linha e falada pelo robo. '/exit' ou Ctrl+D sai.")
+        while True:
+            linha = _ler_linha("say> ")
+            if linha is None or linha == "/exit":
+                return None
+            if linha:
+                self._remoto("falar", linha, TIMEOUT_FALAR_S)
 
-    def do_falar(self, arg):
-        """falar <texto> - o robo fala o texto na caixa (testa a voz)."""
-        return self._remoto("falar", arg)
+    def do_type(self, arg):
+        """type [pergunta] - digita pra o robo como se tivesse sido falado: vai ao cerebro
+        (Jetson 1), que responde em texto e voz. Com a pergunta, envia e mostra a resposta.
+        Sem argumento abre o prompt 'type> ': tudo que voce digitar vai ao cerebro e as
+        respostas aparecem ali. '/exit' ou Ctrl+D volta."""
+        if arg.strip():
+            return self._perguntar(arg.strip())
+        return self._conversar()
 
-    def do_digitar(self, arg):
-        """digitar <texto> - injeta a frase como se tivesse sido falada: aparece na
-        tela e vai pro cerebro (Jetson 1), que responde em texto e voz."""
-        return self._remoto("digitar", arg)
-
-    def do_transcrever(self, arg):
-        """transcrever - mostra ao vivo o que o microfone ouve (e as respostas do robo).
-        Ctrl+C volta ao prompt."""
-        ok, msg = pedir("status")
-        if ok:
-            for linha in msg.splitlines():
-                if linha.startswith("microfone:") and not linha.startswith("microfone: ok"):
-                    print("aviso: " + linha)
+    def _perguntar(self, texto):
+        """Envia uma pergunta e mostra a resposta do robo ate ela terminar."""
         seq = _ancorar()
         if seq is None:
             return 1
-        print("Ouvindo... (Ctrl+C sai)")
-        try:
-            while True:
-                seq = _mostrar_novas(seq, parcial=True)
-                if seq is None:
-                    return 1
-                time.sleep(0.4)
-        except KeyboardInterrupt:
-            print(LIMPA, end="")
-        return None
+        ok, msg = pedir("digitar", texto)
+        if not ok:
+            print("erro: " + msg)
+            return 1
+        if "desconectada" in msg:
+            print(msg)
+        inicio = time.time()
+        while time.time() - inicio < TIMEOUT_RESPOSTA_S:
+            time.sleep(0.3)
+            ok, d = _novas(seq)
+            if not ok:
+                print("erro: " + d)
+                return 1
+            seq = d["seq"]
+            for autor, t in d["itens"]:
+                if autor != "usuario":
+                    print(_rotulo(autor, t), flush=True)
+            if not d["aguardando"]:
+                ok, d = _novas(seq)          # o fim pode ter chegado junto da ultima frase
+                for autor, t in (d["itens"] if ok else []):
+                    if autor != "usuario":
+                        print(_rotulo(autor, t), flush=True)
+                return None
+        print("(o robo nao terminou de responder em %.0f s)" % TIMEOUT_RESPOSTA_S)
+        return 1
 
-    def do_conversar(self, arg):
-        """conversar - modo de conversa por texto, sem microfone: o que voce digita vai
-        ao cerebro (Jetson 1) e as respostas do robo aparecem aqui. "/sair" ou
-        Ctrl+D volta ao prompt."""
+    def _conversar(self):
         seq = _ancorar()
         if seq is None:
             return 1
-        print("Conversa por texto (\"/sair\" ou Ctrl+D sai). O robo responde em texto e voz.")
+        print("Modo type: tudo que voce digitar vai ao cerebro; o robo responde em texto e voz. "
+              "'/exit' ou Ctrl+D sai.")
         pendentes = []                     # o que EU digitei, pra nao repetir o eco
         parar = threading.Event()
 
@@ -190,20 +229,15 @@ class Terminal(cmd.Cmd):
                     if autor == "usuario" and texto in pendentes:
                         pendentes.remove(texto)
                         continue
-                    _imprimir_no_prompt(_rotulo(autor, texto), "voce> ")
+                    _imprimir_no_prompt(_rotulo(autor, texto), "type> ")
                 parar.wait(0.4)
 
-        t = threading.Thread(target=acompanhar, args=(seq,), daemon=True)
-        t.start()
+        threading.Thread(target=acompanhar, args=(seq,), daemon=True).start()
         try:
             while True:
-                try:
-                    linha = input("voce> ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    print()
-                    break
-                if linha == "/sair":
-                    break
+                linha = _ler_linha("type> ")
+                if linha is None or linha == "/exit":
+                    return None
                 if not linha:
                     continue
                 pendentes.append(linha)
@@ -215,19 +249,45 @@ class Terminal(cmd.Cmd):
                     print(msg)
         finally:
             parar.set()
+
+    def do_listen(self, arg):
+        """listen - mostra ao vivo o que o microfone ouve (e as respostas do robo).
+        Ctrl+C volta ao prompt."""
+        ok, msg = pedir("status")
+        if ok:
+            for linha in msg.splitlines():
+                if linha.startswith("microfone:") and not linha.startswith("microfone: ok"):
+                    print("aviso: " + linha)
+        seq = _ancorar()
+        if seq is None:
+            return 1
+        print("Ouvindo... (Ctrl+C sai)")
+        try:
+            while True:
+                ok, d = _novas(seq)
+                if not ok:
+                    print(LIMPA + "erro: " + d)
+                    return 1
+                seq = d["seq"]
+                for autor, texto in d["itens"]:
+                    print(LIMPA + _rotulo(autor, texto), flush=True)
+                print(LIMPA + ("  ... " + d["parcial"] if d["parcial"] else ""), end="", flush=True)
+                time.sleep(0.4)
+        except KeyboardInterrupt:
+            print(LIMPA, end="")
         return None
 
     # ── mexem no processo ──────────────────────────────────────────────
-    def do_iniciar(self, arg):
-        """iniciar [flags] - abre o app se nao estiver rodando (flags vao pro
-        Camera_Simples.py, ex.: iniciar --saudar)."""
+    def do_start(self, arg):
+        """start [flags] - abre o app se nao estiver rodando (as flags vao pro
+        Camera_Simples.py, ex.: start --saudar abre com a saudacao ligada)."""
         return launcher("start", *arg.split())
 
-    def do_reiniciar(self, arg):
-        """reiniciar mic - recria o ouvinte do microfone DENTRO do app, sem reabri-lo, e
+    def do_restart(self, arg):
+        """restart mic - recria o ouvinte do microfone DENTRO do app, sem reabri-lo, e
         confere se chegou audio (se o audio USB da PrimeSense travou, avisa: so replug resolve).
 
-        reiniciar [app|camera] [flags] - encerra o app do jeito limpo (SIGTERM, sem
+        restart [app|camera] [flags] - encerra o app do jeito limpo (SIGTERM, sem
         reset USB) e abre de novo. "camera" e "app" sao a mesma coisa: reabrir o
         sensor dentro do processo trava o OpenNI2. Ao reabrir, a saudacao volta
         ao padrao (desligada), a menos que voce passe --saudar."""
@@ -238,14 +298,17 @@ class Terminal(cmd.Cmd):
             partes = partes[1:]
         return launcher(*partes)
 
-    def do_parar(self, arg):
-        """parar - encerra o app (SIGTERM, sem reset USB)."""
+    def complete_restart(self, texto, linha, inicio, fim):
+        return [o for o in ("mic", "app", "camera") if o.startswith(texto)]
+
+    def do_stop(self, arg):
+        """stop - encerra o app (SIGTERM, sem reset USB)."""
         return launcher("stop")
 
     def do_log(self, arg):
-        """log [tudo] - acompanha o log do app ao vivo (Ctrl+C volta ao prompt).
-        Sem "tudo" esconde as linhas de ruido (quadros de profundidade e falas descartadas)."""
-        tudo = arg.strip() == "tudo"
+        """log [all] - acompanha o log do app ao vivo (Ctrl+C volta ao prompt).
+        Sem "all" esconde as linhas de ruido (quadros de profundidade e falas descartadas)."""
+        tudo = arg.strip() in ("all", "tudo")
         if not os.path.exists(LOG):
             print("erro: sem log em %s (o app ja foi aberto?)" % LOG)
             return 1
@@ -262,26 +325,21 @@ class Terminal(cmd.Cmd):
         return None
 
     # ── terminal ───────────────────────────────────────────────────────
-    def do_ajuda(self, arg):
-        """ajuda [comando] - lista os comandos."""
-        return self.do_help(arg)
-
-    def do_sair(self, arg):
-        """sair - fecha este terminal (o app continua rodando)."""
+    def do_exit(self, arg):
+        """exit - fecha este terminal (o app continua rodando)."""
         return True
+
+    do_quit = do_exit
 
     def do_EOF(self, arg):       # Ctrl+D: quebra a linha do prompt e sai
         print()
         return True
 
-    def get_names(self):         # esconde EOF da lista de ajuda (ele continua valendo)
-        return [n for n in super().get_names() if n != "do_EOF"]
-
     def emptyline(self):
         pass
 
     def default(self, linha):
-        print("comando desconhecido: %s  (digite 'ajuda')" % linha.split()[0])
+        print("comando desconhecido: %s  (digite 'help')" % linha.split()[0])
         return 1
 
     def postcmd(self, stop, linha):
@@ -295,8 +353,6 @@ def main():
         if comando in ("-h", "--help"):
             print(__doc__)
             return 0
-        if comando.split()[0] == "help":
-            comando = "ajuda " + " ".join(comando.split()[1:])
         retorno = terminal.onecmd(comando)
         return retorno if isinstance(retorno, int) and not isinstance(retorno, bool) else 0
     try:

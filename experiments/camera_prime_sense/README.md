@@ -29,21 +29,22 @@ Permite alternar entre os sensores de profundidade, infravermelho e cor, exibir 
 
 ## Terminal de controle (`camera`)
 
-`camera` (`src/jetson/bin/camera`, atalho em `~/.local/bin/camera`) controla o app em execução por um socket Unix (`/tmp/camera.sock`), sem reiniciar nada. Sem argumentos abre um terminal interativo; com argumento roda um comando e sai (`camera saudar on`).
+`camera` (`src/jetson/bin/camera`, atalho em `~/.local/bin/camera`) controla o app em execução por um socket Unix (`/tmp/camera.sock`), sem reiniciar nada. Sem argumentos abre um terminal interativo; com argumento roda um comando e sai (`camera greet on`). Os comandos são em inglês (os nomes antigos em português continuam funcionando, fora do `help`).
 
 | Comando | O que faz |
 |---|---|
-| `status` | estado de câmera, profundidade, rostos, microfone (com diagnóstico), cérebro e saudação |
-| `saudar [on\|off\|texto <frase>\|dist <min> <max>\|intervalo <s>]` | liga/desliga e ajusta o "bom dia" por proximidade, ao vivo |
-| `falar <texto>` | o robô fala o texto na caixa |
-| `digitar <texto>` | injeta a frase como se tivesse sido falada (vai ao cérebro) |
-| `transcrever` | mostra ao vivo o que o microfone ouve e as respostas do robô (Ctrl+C sai) |
-| `conversar` | conversa por **texto**, sem microfone: o que você digita vai ao cérebro e as respostas aparecem ali (`/sair` sai) |
-| `reiniciar mic` | recria o ouvinte do microfone dentro do app e confere se chegou áudio; se o áudio USB da PrimeSense travou, avisa que só um replug resolve |
-| `iniciar [flags]`, `reiniciar [flags]`, `parar` | abrem/reiniciam/encerram o app pelo `camera-simples` (SIGTERM primeiro, sem reset USB) |
-| `log [tudo]` | acompanha o log sem o ruído de profundidade e falas descartadas |
+| `status` | estado de câmera, profundidade, rostos, microfone (com diagnóstico), cérebro, voz e saudação |
+| `greet [on\|off\|text <frase>\|dist <min> <max>\|interval <s>]` | liga/desliga e ajusta o "bom dia" por proximidade, ao vivo |
+| `say [texto]` | o robô fala o texto com a **voz dele** (Piper, a mesma das respostas). Sem texto abre o prompt `say> `, que fala cada linha digitada |
+| `type [pergunta]` | digita para o robô como se tivesse sido falado (vai ao cérebro). Com a pergunta, envia e mostra a resposta. Sem argumento abre o prompt `type> `, onde tudo que você digita vai ao cérebro e as respostas aparecem |
+| `listen` | mostra ao vivo o que o microfone ouve e as respostas do robô (Ctrl+C sai) |
+| `restart mic` | recria o ouvinte do microfone dentro do app e confere se chegou áudio; se o áudio USB da PrimeSense travou, avisa que só um replug resolve |
+| `start [flags]`, `restart [flags]`, `stop` | abrem/reiniciam/encerram o app pelo `camera-simples` (SIGTERM primeiro, sem reset USB) |
+| `log [all]` | acompanha o log sem o ruído de profundidade e falas descartadas |
 
 A saudação começa desligada; `--saudar` a abre ligada. Módulos: `controle.py` (servidor do socket), `comandos.py` (os comandos), `saudacao.py`. Sem microfone (`--no-mic` ou mic indisponível na abertura) a janela de texto e a conversa continuam funcionando por digitação.
+
+**Voz do robô (`say` e saudação):** o Piper só existe na Jetson 1, então ela sintetiza o texto e esta Jetson toca. Isso exige o `src/jetson1/servidor_conversa.py` novo na Jetson 1 (copie e reinicie o servidor). Com o servidor antigo, o `status` mostra "voz: local" e o `say` cai para o `spd-say` (voz robótica, pouco confiável dentro do app), avisando o motivo.
 
 ## Requisitos
 
