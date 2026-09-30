@@ -51,6 +51,7 @@ TIMEOUT_RESPOSTA_S = 90.0               # depois disso `aguardando()` desiste
 # (ver jetson/bin/say e say-keepalive, que resolvem igual): um fluxo continuo de
 # silencio (keepalive) mais um ruido inaudivel colado antes de cada fala.
 KEEPALIVE_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", "say-keepalive")
+KEEPALIVE_CHECK_S = 20                   # de quanto em quanto tempo confere se o keepalive segue tocando
 LEAD_MS = 50
 LEAD_AMP = 30                            # ~ -60 dBFS: inaudivel, mas acorda o amplificador
 
@@ -89,11 +90,13 @@ def com_lead_in(wav, ms=LEAD_MS, amp=LEAD_AMP):
         return wav
 
 
-def _ligar_keepalive():
-    """Mantem um fluxo de silencio no sink HDMI (idempotente, em segundo plano)."""
-    if not os.path.exists(KEEPALIVE_BIN):
-        return
+def _garantir_keepalive():
+    """Garante um fluxo de silencio no sink HDMI: sobe o PulseAudio se estiver fora e
+    (re)inicia o say-keepalive, que agora so se considera ativo se o pacat esta de pe."""
     try:
+        if subprocess.run(["pulseaudio", "--check"], timeout=10).returncode != 0:
+            subprocess.run(["pulseaudio", "--start"], timeout=20,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run([KEEPALIVE_BIN, "start"], timeout=20,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError) as e:
@@ -127,7 +130,7 @@ class ClienteConversa:
         self._tocador = None                 # paplay em andamento (pra poder interromper)
         self._envio = queue.Queue()
         self._reproducao = queue.Queue()
-        threading.Thread(target=_ligar_keepalive, daemon=True).start()
+        threading.Thread(target=self._vigiar_keepalive, daemon=True).start()
         threading.Thread(target=self._loop_conexao, daemon=True).start()
         threading.Thread(target=self._loop_envio, daemon=True).start()
         threading.Thread(target=self._loop_reproducao, daemon=True).start()
@@ -138,6 +141,18 @@ class ClienteConversa:
 
     def falando(self):
         return self._tocando > 0 or time.time() < self._mudo_ate
+
+    def _vigiar_keepalive(self):
+        """O PulseAudio cai (launcher, queda) e leva o keepalive junto; sem ele o monitor HDMI
+        dorme e corta a 1a silaba. Confere de tempos em tempos e religa."""
+        if not os.path.exists(KEEPALIVE_BIN):
+            return
+        while self._rodando:
+            _garantir_keepalive()
+            for _ in range(int(KEEPALIVE_CHECK_S)):
+                if not self._rodando:
+                    return
+                time.sleep(1.0)
 
     def aguardando(self):
         """True desde que uma pergunta foi enviada ate chegar o fim da resposta."""
