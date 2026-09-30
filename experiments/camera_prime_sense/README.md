@@ -27,6 +27,52 @@ Permite alternar entre os sensores de profundidade, infravermelho e cor, exibir 
 - **Resolução:** o sensor é consultado em runtime e a cor usa 640×480@30 por padrão (medido: 29 fps reais). 1280×1024 é anunciado a 30 fps mas entrega ~5 fps (limite do USB 2.0) e trava se combinado com profundidade; só com `--res 1280x1024`.
 - **Leveza:** o realce (CLAHE + unsharp) roda no tamanho de exibição, sem filtro bilateral; a profundidade não usa mais `inpaint` (fechamento morfológico no lugar); redimensionamento com INTER_LINEAR.
 
+## Terminal de controle (`camera`)
+
+**Instalação (uma vez por Jetson):** os atalhos não são versionados, então crie os links em `~/.local/bin` (já está no `PATH` depois do login):
+
+```
+ln -sf ~/dev/LSA_robot/src/jetson/bin/camera        ~/.local/bin/camera
+ln -sf ~/dev/LSA_robot/src/jetson/bin/camera-simples ~/.local/bin/camera-simples
+```
+
+O `camera-simples` (launcher) abre/encerra o app e espera a PrimeSense aparecer no USB; o `camera` é o terminal de controle. Para a voz do robô, atualize também o `servidor_conversa.py` na Jetson 1 (veja *Voz do robô* abaixo).
+
+`camera` (`src/jetson/bin/camera`, atalho em `~/.local/bin/camera`) controla o app em execução por um socket Unix (`/tmp/camera.sock`), sem reiniciar nada. Sem argumentos abre um terminal interativo; com argumento roda um comando e sai (`camera greet on`). Os comandos são em inglês (os nomes antigos em português continuam funcionando, fora do `help`).
+
+| Comando | O que faz |
+|---|---|
+| `status` | estado de câmera, profundidade, rostos, microfone (com diagnóstico), cérebro, voz e saudação |
+| `greet [on\|off\|text <frase>\|dist <min> <max>\|interval <s>]` | liga/desliga e ajusta o "bom dia" por proximidade, ao vivo |
+| `say [texto]` | o robô fala o texto com a **voz dele** (Piper, a mesma das respostas). Sem texto abre o prompt `say> `, que fala cada linha digitada |
+| `type [pergunta]` | digita para o robô como se tivesse sido falado (vai ao cérebro). Com a pergunta, envia e mostra a resposta. Sem argumento abre o prompt `type> `, onde tudo que você digita vai ao cérebro e as respostas aparecem |
+| `shush` | interrompe a fala do robô agora (corta o áudio e descarta o resto da resposta) |
+| `chat [on\|off]` | liga/desliga a conversa por voz: desligada, o microfone só transcreve e o robô não responde ao ambiente (`type` e `say` continuam funcionando). `--chat-off` abre já desligada |
+| `listen` | mostra ao vivo o que o microfone ouve e as respostas do robô (Ctrl+C sai) |
+| `restart mic` | recria o ouvinte do microfone dentro do app e confere se chegou áudio; se o áudio USB da PrimeSense travou, avisa que só um replug resolve |
+| `start [flags]`, `restart [flags]`, `stop` | abrem/reiniciam/encerram o app pelo `camera-simples` (SIGTERM primeiro, sem reset USB) |
+| `log [all\|important\|today [N]\|days\|day <data> [N]]` | logs com data, hora e cor, ao vivo ou por dia (veja *Logs* abaixo) |
+
+A saudação começa desligada; `--saudar` a abre ligada. Módulos: `controle.py` (servidor do socket), `comandos.py` (os comandos), `saudacao.py`. Sem microfone (`--no-mic` ou mic indisponível na abertura) a janela de texto e a conversa continuam funcionando por digitação.
+
+**Voz do robô (`say` e saudação):** o Piper só existe na Jetson 1, então ela sintetiza o texto e esta Jetson toca. Isso exige o `src/jetson1/servidor_conversa.py` novo na Jetson 1 (copie e reinicie o servidor). Com o servidor antigo, o `status` mostra "voz: local" e o `say` cai para o `spd-say` (voz robótica, pouco confiável dentro do app), avisando o motivo.
+
+## Logs
+
+O app imprime cada evento com data, hora, **nível** e **tag**, sem que cada `print` do projeto precise mudar (`camera_log.py` envolve `stdout`/`stderr`):
+
+```
+2026-09-30 15:36:46 INFO  [saudacao] falando 'teste do log' (voz do robo (Piper, Jetson 1))
+2026-09-30 15:36:48 WARN  [mic_vad] desisti de religar o arecord — mic offline
+```
+
+Níveis: `DEBUG` (ruído: quadros de profundidade, falas descartadas, áudio recebido), `INFO`, `WARN` e `ERROR`. Dois destinos:
+
+- **Sessão** (`/tmp/camera-simples.log`, recriado a cada abertura): tudo, com o ruído como `DEBUG`.
+- **Arquivo por dia** (`logs/camera/AAAA-MM-DD.log`, fora do git, guardado por 30 dias): só o que importa, isto é, avisos e erros (inclusive tracebacks), conexões com a Jetson 1, frases reconhecidas, respostas do robô, saudações, comandos do terminal `camera` e início/fim do app. Linhas iguais e seguidas viram "(a linha acima se repetiu mais N vezes)".
+
+`camera log` mostra tudo isso com cores (vermelho = erro, amarelo = aviso, cinza = ruído, uma cor por tag nos eventos). Sem argumento acompanha a sessão sem o ruído; `log all` inclui o ruído; `log important` acompanha o arquivo de hoje; `log today [N]`, `log days` e `log day AAAA-MM-DD [N]` leem os arquivos diários. A pasta pode ser trocada com `CAMERA_LOG_DIR`.
+
 ## Requisitos
 
 ### Hardware

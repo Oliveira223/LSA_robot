@@ -22,16 +22,25 @@ RAW="$HOME/piper/keepalive.raw"
 PIDF="$HOME/.cache/say-keepalive.pid"
 mkdir -p "$(dirname "$PIDF")"
 
-alive() { [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null; }
+# "ativo" so vale se o pacat esta de pe: quando o PulseAudio morre (ex.: pkill do
+# camera-simples, ou queda), o pacat morre junto e o laco do bash fica girando a toa
+# com o PID ainda vivo — antes isso aparecia como "ATIVO" sem tocar nada, e o monitor
+# HDMI dormia e cortava a 1a silaba.
+alive() {
+    [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF" 2>/dev/null)" 2>/dev/null \
+        && pgrep -xf "pacat .*client-name=say-keepalive" >/dev/null 2>&1
+}
 
 stop() {
     if [ -f "$PIDF" ]; then
         local p; p="$(cat "$PIDF" 2>/dev/null)"
+        # o laco roda em setsid: derruba o grupo inteiro (bash + cat + pacat)
+        [ -n "$p" ] && kill -- "-$p" 2>/dev/null
         [ -n "$p" ] && kill "$p" 2>/dev/null
-        # mata tambem o filho pacat/cat do grupo
         [ -n "$p" ] && pkill -P "$p" 2>/dev/null
         rm -f "$PIDF"
     fi
+    pkill -xf "pacat .*client-name=say-keepalive" 2>/dev/null
 }
 
 case "${1:-start}" in
@@ -42,7 +51,7 @@ case "${1:-start}" in
 esac
 
 alive && { echo "keepalive ja ativo (pid $(cat "$PIDF"))."; exit 0; }
-rm -f "$PIDF"
+stop                # limpa restos (laco orfao sem pacat) antes de subir de novo
 
 # buffer de ~10s gerado uma vez (loop de 'cat' = wake ~a cada 10s, custo ~0)
 if [ ! -s "$RAW" ] || [ "${KEEPALIVE_REGEN:-0}" = 1 ]; then

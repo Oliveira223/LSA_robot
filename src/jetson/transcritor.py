@@ -113,22 +113,29 @@ class ClienteTranscricao:
     "carregando", "pronto" ou "erro".
     """
 
-    def __init__(self, ouvinte=None, modelo=None):
+    def __init__(self, ouvinte=None, modelo=None, sem_mic=False):
+        """`sem_mic=True`: funciona so por texto (enviar_texto / comando `digitar`
+        do terminal `camera`), sem ouvinte — pra quando o microfone da PrimeSense
+        esta fora do ar. Um ouvinte pode entrar depois com trocar_ouvinte()."""
         self._modelo = modelo or _pasta_modelo()
         if not os.path.isdir(self._modelo):
             raise ErroDeTranscricao("modelo Vosk nao encontrado em %s" % self._modelo)
 
-        self._ouvinte_proprio = ouvinte is None
+        self._ouvinte_proprio = ouvinte is None and not sem_mic
         try:
-            self._ouvinte = ouvinte or OuvinteVAD()
+            self._ouvinte = None if sem_mic else (ouvinte or OuvinteVAD())
         except ErroDeMic as e:
             raise ErroDeTranscricao("microfone indisponivel: %s" % e)
 
         self._lock = threading.Lock()
         self._mensagens = []
+        self._registro = []        # (seq, autor, texto) numerado, pro terminal `camera`
+        self._seq = 0
         self._estado = "carregando"
         self._parcial = ""
         self._conversa = None      # ClienteConversa (Jetson 1), opcional
+        self.conversa_ativa = True # False: a fala do mic so aparece na tela, nao vai ao cerebro
+        self._mudo_extra = None
         self._estava_mudo = False
         self._rodando = True
         self._proc = None
@@ -139,7 +146,8 @@ class ClienteTranscricao:
         # ninguem mais consome isso aqui, entao esvazia pra nao acumular memoria.
         self._drenagem = threading.Thread(target=self._drenar, daemon=True)
         self._drenagem.start()
-        self._ouvinte.definir_ao_audio(self._ao_audio)
+        if self._ouvinte is not None:
+            self._ouvinte.definir_ao_audio(self._ao_audio)
 
     # ── consulta (thread do video) ─────────────────────────────────────
     def mensagens(self):
@@ -158,16 +166,51 @@ class ClienteTranscricao:
         transcrita e enviada a ele e o microfone fica mudo enquanto o robo fala."""
         self._conversa = conversa
 
+    def trocar_ouvinte(self, novo):
+        """Passa a escutar `novo` (um OuvinteVAD) no lugar do atual, ou nenhum (None).
+        Quem chama e dono dos ouvintes: para o antigo e cria o novo."""
+        antigo = self._ouvinte
+        if antigo is not None:
+            antigo.definir_ao_audio(None)
+        self._ouvinte = novo
+        self._ouvinte_proprio = False
+        self._estava_mudo = False
+        if novo is not None:
+            novo.definir_ao_audio(self._ao_audio)
+
+    def registro_desde(self, seq):
+        """(ultimo_seq, [(autor, texto), ...], parcial): as mensagens surgidas depois
+        de `seq` (0 = todas as guardadas) e o texto parcial de uma fala em curso.
+        Usado por `transcrever`/`conversar` do terminal `camera`."""
+        with self._lock:
+            itens = [(a, t) for (n, a, t) in self._registro if n > seq]
+            return self._seq, itens, self._parcial
+
+    def definir_mudo_extra(self, funcao):
+        """funcao() -> True enquanto o robo fala por outro caminho (ex.: a
+        saudacao por proximidade), pra o mic nao transcrever a propria voz."""
+        self._mudo_extra = funcao
+
     def adicionar(self, autor, texto):
         """Acrescenta uma bolha ("usuario" ou "robo") a conversa mostrada na tela."""
         with self._lock:
             self._mensagens.append((autor, texto))
             if len(self._mensagens) > MAX_MENSAGENS:
                 self._mensagens.pop(0)
+            self._seq += 1
+            self._registro.append((self._seq, autor, texto))
+            if len(self._registro) > 200:
+                self._registro.pop(0)
 
-    def _adicionar(self, texto):
+    def enviar_texto(self, texto):
+        """Injeta `texto` como se tivesse sido falado (bolha do usuario + envio
+        ao cerebro). Usado pelo comando `type` do terminal `camera`. Vai ao
+        cerebro mesmo com a conversa por voz desligada: digitar e pedir resposta."""
+        self._adicionar(texto, forcar=True)
+
+    def _adicionar(self, texto, forcar=False):
         self.adicionar("usuario", texto)
-        if self._conversa is not None:
+        if self._conversa is not None and (self.conversa_ativa or forcar):
             self._conversa.enviar(texto)
 
     def _set(self, estado=None, parcial=None):
@@ -181,7 +224,8 @@ class ClienteTranscricao:
         # roda na thread do mic: so enfileira
         if self._estado != "pronto":
             return
-        if self._conversa is not None and self._conversa.falando():
+        if ((self._conversa is not None and self._conversa.falando())
+                or (self._mudo_extra is not None and self._mudo_extra())):
             # o robo esta falando: o mic ouviria a propria voz dele
             if not self._estava_mudo:
                 self._estava_mudo = True
@@ -192,7 +236,11 @@ class ClienteTranscricao:
 
     def _drenar(self):
         while self._rodando:
-            self._ouvinte.proxima_fala(timeout=1.0)
+            ouvinte = self._ouvinte          # pode ser trocado/None a qualquer momento
+            if ouvinte is None:
+                time.sleep(0.5)
+                continue
+            ouvinte.proxima_fala(timeout=1.0)
 
     # ── worker ─────────────────────────────────────────────────────────
     def _iniciar_worker(self):
@@ -288,9 +336,10 @@ class ClienteTranscricao:
 
     def parar(self):
         self._rodando = False
-        self._ouvinte.definir_ao_audio(None)
-        if self._ouvinte_proprio:
-            self._ouvinte.parar()
+        if self._ouvinte is not None:
+            self._ouvinte.definir_ao_audio(None)
+            if self._ouvinte_proprio:
+                self._ouvinte.parar()
         if self._proc is not None:
             try:
                 self._proc.stdin.close()

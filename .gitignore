@@ -27,6 +27,7 @@ audio_temp/
 !**/fixtures/*.wav
 
 .claude/
+logs/
 graphify-out/
 
 # Pesos do YOLO (baixados, ~230 MB)

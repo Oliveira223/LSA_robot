@@ -30,6 +30,10 @@ import subprocess
 import sys
 import threading
 import time
+import types
+
+import camera_log
+camera_log.instalar()          # ja aqui: os avisos de import tambem saem com data/hora e nivel
 
 import cv2
 import numpy as np
@@ -38,6 +42,10 @@ from primesense import openni2
 from camera_utils import (HUD_AMARELO, HUD_CIANO, HudTela, MedidorDistancia,
                           configurar_cor, configurar_depth, criar_detector_rosto,
                           desenhar_alvos_hud, localizar_openni2_redist)
+
+from comandos import registrar_comandos
+from controle import ServidorControle
+from saudacao import Saudador
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -522,6 +530,9 @@ def main():
                      help="servidor de conversa na Jetson 1 (padrao %s:%d, pelo cabo). Cada frase "
                           "transcrita vai pra la e a resposta (texto + voz) volta; so vale com "
                           "--stt local" % (HOST_PADRAO, PORTA_PADRAO))
+    ap.add_argument("--chat-off", action="store_true",
+                     help="abre com a conversa por voz DESLIGADA: o microfone so transcreve e a fala "
+                          "nao vai ao cerebro (religue com `camera chat on`; `type` sempre responde)")
     ap.add_argument("--no-cerebro", action="store_true",
                      help="so transcreve, sem conversar com a Jetson 1")
     ap.add_argument("--no-chat", action="store_true",
@@ -530,6 +541,17 @@ def main():
                      help="IP do PC rodando pc.server_voz (padrao 127.0.0.1)")
     ap.add_argument("--chat-port", type=int, default=5000,
                      help="porta do pc.server_voz (padrao 5000)")
+    ap.add_argument("--saudar", action="store_true",
+                     help="TESTE: fala uma saudacao quando um rosto chega perto "
+                          "(precisa da profundidade e da deteccao de rosto ligadas)")
+    ap.add_argument("--saudar-dist-min", type=float, default=0.8, metavar="M",
+                     help="distancia minima em metros pra saudar (padrao 0.8)")
+    ap.add_argument("--saudar-dist-max", type=float, default=1.2, metavar="M",
+                     help="distancia maxima em metros pra saudar (padrao 1.2)")
+    ap.add_argument("--saudar-texto", default="Bom dia",
+                     help="frase falada na saudacao (padrao 'Bom dia')")
+    ap.add_argument("--saudar-intervalo", type=float, default=20.0, metavar="S",
+                     help="segundos minimos entre duas saudacoes (padrao 20)")
     ap.add_argument("--dump-frames", metavar="DIR", default=None,
                      help="salva um quadro cru da camera a cada 0.4 s em DIR (pra avaliar detectores offline)")
     ap.add_argument("--profile", action="store_true",
@@ -537,6 +559,8 @@ def main():
     args = ap.parse_args()
     if args.espera:
         return tela_espera()
+    print("[app] iniciado (pid %d, args: %s)" % (os.getpid(), " ".join(sys.argv[1:]) or "nenhum"),
+          flush=True)
 
     detector = None if args.no_faces else criar_detector_rosto(args.face_size, args.face_conf)
 
@@ -559,6 +583,12 @@ def main():
     time.sleep(1.5)
     visual_som = VisualizadorSom()
 
+    def criar_ouvinte():
+        kwargs = {"ganho": args.mic_ganho, "silencio_s": args.mic_silencio}
+        if args.mic_limiar:
+            kwargs["limiar_fala"] = args.mic_limiar
+        return OuvinteVAD(**kwargs)
+
     ouvinte = None
     if args.mic_mock:
         if OuvinteMock is not None:
@@ -568,10 +598,7 @@ def main():
                   file=sys.stderr)
     elif not args.no_mic and OuvinteVAD is not None:
         try:
-            kwargs = {"ganho": args.mic_ganho, "silencio_s": args.mic_silencio}
-            if args.mic_limiar:
-                kwargs["limiar_fala"] = args.mic_limiar
-            ouvinte = OuvinteVAD(**kwargs)
+            ouvinte = criar_ouvinte()
         except ErroDeMic as e:
             print(f"AVISO: microfone indisponivel ({e}); seguindo sem indicador de mic.",
                   file=sys.stderr)
@@ -583,21 +610,52 @@ def main():
     if args.stt == "local" and not args.mic_mock:
         if ClienteTranscricao is None:
             pass  # o aviso do import ja foi impresso
-        elif ouvinte is None:
-            print("AVISO: sem microfone, seguindo sem janela de texto.", file=sys.stderr)
         else:
             try:
-                # mesmo OuvinteVAD do indicador de mic (so pode ter um arecord por vez)
-                transcritor = ClienteTranscricao(ouvinte=ouvinte)
+                # mesmo OuvinteVAD do indicador de mic (so pode ter um arecord por vez).
+                # Sem microfone o painel e a conversa continuam: da pra digitar pelo
+                # terminal `camera` (comando digitar/conversar).
+                if ouvinte is None:
+                    print("AVISO: sem microfone; a janela de texto funciona so por "
+                          "digitacao (terminal `camera`).", file=sys.stderr)
+                transcritor = ClienteTranscricao(ouvinte=ouvinte, sem_mic=ouvinte is None)
                 painel_texto = PainelTranscricao()
                 if not args.no_cerebro and ClienteConversa is not None:
                     host, _, porta = args.cerebro.partition(":")
                     conversa = ClienteConversa(host, int(porta or PORTA_PADRAO),
                                                ao_mensagem=transcritor.adicionar)
                     transcritor.definir_conversa(conversa)
+                    transcritor.conversa_ativa = not args.chat_off
             except ErroDeTranscricao as e:
                 print(f"AVISO: transcricao indisponivel ({e}); seguindo sem janela de texto.",
                       file=sys.stderr)
+
+    # O Saudador sempre existe (o terminal `camera` pode ligar/desligar ao vivo);
+    # comeca ligado so com --saudar. Precisa de rostos + profundidade pra ter distancia.
+    saudavel = detector is not None and medidor is not None
+    if args.saudar and not saudavel:
+        print("AVISO: --saudar precisa de deteccao de rosto e profundidade "
+              "(sem --no-faces/--no-distancia); saudacao desligada.", file=sys.stderr)
+    saudador = Saudador(args.saudar_texto, args.saudar_dist_min, args.saudar_dist_max,
+                        args.saudar_intervalo, ativo=args.saudar and saudavel,
+                        disponivel=saudavel)
+    if transcritor is not None:
+        transcritor.definir_mudo_extra(saudador.falando)
+    if conversa is not None:
+        saudador.definir_voz_cerebro(conversa.falar_literal)   # mesma voz das respostas
+
+    mic = types.SimpleNamespace(ouvinte=ouvinte)   # o `reiniciar mic` troca o ouvinte aqui
+    pode_reiniciar_mic = OuvinteVAD is not None and not args.no_mic and not args.mic_mock
+    servidor = ServidorControle()
+    registrar_comandos(servidor, args, saudador, mic, transcritor, conversa,
+                       leitor_depth, detector,
+                       criar_ouvinte=criar_ouvinte if pode_reiniciar_mic else None,
+                       erro_de_mic=ErroDeMic)
+    try:
+        servidor.iniciar()
+    except OSError as e:
+        print("AVISO: canal de controle indisponivel (%s); o terminal `camera` nao vai "
+              "conseguir falar com o app." % e, file=sys.stderr)
 
     cliente_chat = None
     if args.stt == "pc" and ClienteChat is not None:
@@ -690,13 +748,15 @@ def main():
                                     (i, (x * fx, y * fy, w * fx, h * fy)) for (i, (x, y, w, h), _) in caixas])
                         except Exception as e:
                             print(f"AVISO: falha lendo profundidade ({e})", file=sys.stderr)
+                    saudador.atualizar(distancias)
                     desenhar_alvos_hud(cor, alvos, distancias)
                 hud.desenhar(cor, len(alvos), detector is not None)
                 t0 = marca("hud", t0)
 
                 quadro = cor
-                if ouvinte is not None:
-                    quadro = compor_hud_transparente(quadro, visual_som, ouvinte, canto=args.corner)
+                ouvinte_atual = mic.ouvinte
+                if ouvinte_atual is not None:
+                    quadro = compor_hud_transparente(quadro, visual_som, ouvinte_atual, canto=args.corner)
                 if cliente_chat:
                     quadro = desenhar_chat(quadro, cliente_chat.mensagens())
                 if transcritor:
@@ -762,7 +822,9 @@ def main():
             if tecla in (ord("q"), 27):  # 'q' ou ESC
                 break
     finally:
+        print("[app] encerrando", flush=True)
         parar.set()
+        servidor.parar()
         produtor.join(timeout=2)
         if detector:
             detector.parar()
@@ -772,8 +834,8 @@ def main():
             conversa.parar()
         if transcritor:
             transcritor.parar()
-        if ouvinte:
-            ouvinte.parar()
+        if mic.ouvinte:
+            mic.ouvinte.parar()
         if leitor_depth:
             leitor_depth.parar()
         parar_sensor(color_stream, depth_stream)

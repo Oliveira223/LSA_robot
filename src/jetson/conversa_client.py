@@ -28,15 +28,32 @@ Uso (a partir de src/, teste isolado; digite e a resposta e falada):
     python3 -m jetson.conversa_client [host] [porta]
 """
 
+import io
 import os
 import queue
+import random
 import socket
+import struct
 import subprocess
 import tempfile
 import threading
 import time
+import wave
 
 from common.protocol import AUDIO, TEXTO, recv_msg, send_texto
+
+CTRL = "\x00"                          # TEXTO de controle do servidor (ver servidor_conversa.py)
+PREFIXO_FALAR = CTRL + "falar:"
+TIMEOUT_FALAR_S = 20.0
+TIMEOUT_RESPOSTA_S = 90.0               # depois disso `aguardando()` desiste
+
+# O monitor HDMI "dorme" o audio entre as falas e corta a 1a silaba quando o som volta
+# (ver jetson/bin/say e say-keepalive, que resolvem igual): um fluxo continuo de
+# silencio (keepalive) mais um ruido inaudivel colado antes de cada fala.
+KEEPALIVE_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", "say-keepalive")
+KEEPALIVE_CHECK_S = 20                   # de quanto em quanto tempo confere se o keepalive segue tocando
+LEAD_MS = 50
+LEAD_AMP = 30                            # ~ -60 dBFS: inaudivel, mas acorda o amplificador
 
 HOST_PADRAO = "10.10.10.1"
 PORTA_PADRAO = 5005
@@ -49,6 +66,41 @@ RECONEXAO_BACKOFF_MAX_S = 10.0
 TIMEOUT_CONEXAO_S = 3.0
 CAUDA_S = 0.7            # o microfone continua mudo por isso apos o fim da fala
 MAX_MENSAGENS = 8
+
+
+def com_lead_in(wav, ms=LEAD_MS, amp=LEAD_AMP):
+    """Devolve o WAV com `ms` de ruido quase inaudivel na frente (acorda o audio HDMI
+    antes da 1a silaba). Se o WAV nao for PCM 16 bits, devolve como veio."""
+    try:
+        with wave.open(io.BytesIO(wav), "rb") as w:
+            canais, largura, taxa = w.getnchannels(), w.getsampwidth(), w.getframerate()
+            quadros = w.readframes(w.getnframes())
+        if largura != 2:
+            return wav
+        n = int(taxa * ms / 1000) * canais
+        ruido = struct.pack("<%dh" % n, *[random.randint(-amp, amp) for _ in range(n)])
+        saida = io.BytesIO()
+        with wave.open(saida, "wb") as w:
+            w.setnchannels(canais)
+            w.setsampwidth(largura)
+            w.setframerate(taxa)
+            w.writeframes(ruido + quadros)
+        return saida.getvalue()
+    except (wave.Error, EOFError, struct.error):
+        return wav
+
+
+def _garantir_keepalive():
+    """Garante um fluxo de silencio no sink HDMI: sobe o PulseAudio se estiver fora e
+    (re)inicia o say-keepalive, que agora so se considera ativo se o pacat esta de pe."""
+    try:
+        if subprocess.run(["pulseaudio", "--check"], timeout=10).returncode != 0:
+            subprocess.run(["pulseaudio", "--start"], timeout=20,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run([KEEPALIVE_BIN, "start"], timeout=20,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as e:
+        print("[conversa] keepalive de audio nao subiu: %s" % e, flush=True)
 
 
 class ClienteConversa:
@@ -70,8 +122,15 @@ class ClienteConversa:
         self._rodando = True
         self._tocando = 0                    # frases na fila de reproducao ou tocando
         self._mudo_ate = 0.0
+        self._suporta_falar = False          # servidor novo anuncia no hello
+        self._fim = threading.Event()        # setado quando chega o TEXTO vazio (fim da resposta)
+        self._aguardando_desde = 0.0         # !=0 enquanto espera o fim de uma resposta
+        self._descartar_ate = 0.0            # `interromper`: ignora o audio ate o fim da resposta
+                                             # (ou TIMEOUT_RESPOSTA_S, se o fim nunca chegar)
+        self._tocador = None                 # paplay em andamento (pra poder interromper)
         self._envio = queue.Queue()
         self._reproducao = queue.Queue()
+        threading.Thread(target=self._vigiar_keepalive, daemon=True).start()
         threading.Thread(target=self._loop_conexao, daemon=True).start()
         threading.Thread(target=self._loop_envio, daemon=True).start()
         threading.Thread(target=self._loop_reproducao, daemon=True).start()
@@ -83,15 +142,81 @@ class ClienteConversa:
     def falando(self):
         return self._tocando > 0 or time.time() < self._mudo_ate
 
+    def _vigiar_keepalive(self):
+        """O PulseAudio cai (launcher, queda) e leva o keepalive junto; sem ele o monitor HDMI
+        dorme e corta a 1a silaba. Confere de tempos em tempos e religa."""
+        if not os.path.exists(KEEPALIVE_BIN):
+            return
+        while self._rodando:
+            _garantir_keepalive()
+            for _ in range(int(KEEPALIVE_CHECK_S)):
+                if not self._rodando:
+                    return
+                time.sleep(1.0)
+
+    def aguardando(self):
+        """True desde que uma pergunta foi enviada ate chegar o fim da resposta."""
+        desde = self._aguardando_desde
+        return bool(desde) and time.time() - desde < TIMEOUT_RESPOSTA_S
+
+    def interromper(self):
+        """Corta a fala agora: para o audio que esta tocando, esvazia a fila e ignora o
+        resto do audio da resposta em curso (o texto continua chegando). Devolve quantas
+        frases foram descartadas."""
+        descartadas = 0
+        with self._lock:
+            if self.aguardando():        # so ha o que descartar se a resposta ainda esta chegando
+                self._descartar_ate = time.time() + TIMEOUT_RESPOSTA_S
+            while True:
+                try:
+                    self._reproducao.get_nowait()
+                except queue.Empty:
+                    break
+                self._tocando -= 1
+                descartadas += 1
+            tocador = self._tocador
+        if tocador is not None and tocador.poll() is None:
+            tocador.terminate()
+            descartadas += 1
+        return descartadas
+
+    def descartando(self):
+        """True se o audio do resto da resposta em curso esta sendo ignorado (apos interromper)."""
+        return time.time() < self._descartar_ate
+
+    def suporta_falar(self):
+        return self._conectado and self._suporta_falar
+
+    def falar_literal(self, texto, timeout=TIMEOUT_FALAR_S):
+        """Pede a Jetson 1 pra falar `texto` com a voz do robo (Piper), sem passar
+        pelo cerebro, e espera terminar de tocar aqui. Devolve (ok, mensagem)."""
+        if not self._conectado:
+            return False, "Jetson 1 desconectada"
+        if not self._suporta_falar:
+            return False, ("o servidor da Jetson 1 e antigo e nao sabe falar texto literal "
+                           "(atualize servidor_conversa.py la e reinicie)")
+        self._fim.clear()
+        self._aguardando_desde = time.time()
+        self._envio.put(PREFIXO_FALAR + texto)
+        if not self._fim.wait(timeout):
+            self._descartar_ate = time.time() + TIMEOUT_RESPOSTA_S   # fala atrasada nao toca por cima
+            return False, "a Jetson 1 nao respondeu em %.0f s" % timeout
+        limite = time.time() + 60.0
+        while self.falando() and time.time() < limite:
+            time.sleep(0.1)
+        return True, "voz do robo (Piper, Jetson 1)"
+
     def enviar(self, texto):
         """Enfileira a pergunta. Se nao ha conexao, avisa e descarta (o robo
         nao vai responder uma pergunta de minutos atras quando voltar)."""
         if not self._conectado:
             self._nova_bolha("robo", "Estou sem conexão com o meu cérebro.")
             return
+        self._aguardando_desde = time.time()
         self._envio.put(texto)
 
     def _nova_bolha(self, autor, texto):
+        print("[conversa] %s: %s" % (autor, texto), flush=True)
         if self._ao_mensagem:
             self._ao_mensagem(autor, texto)
 
@@ -110,6 +235,9 @@ class ClienteConversa:
             espera = RECONEXAO_BACKOFF_S
             with self._lock:
                 self._sock = s
+            self._suporta_falar = False
+            self._aguardando_desde = 0.0
+            self._descartar_ate = 0.0              # conexao nova: nada pendente pra descartar
             self._conectado = True
             print("[conversa] conectado em %s:%d" % (self._host, self._porta), flush=True)
             try:
@@ -133,9 +261,20 @@ class ClienteConversa:
                 raise ConnectionError("Jetson 1 fechou a conexao")
             if msg.tipo == TEXTO:
                 texto = msg.texto.strip()
-                if texto:              # texto vazio = fim da resposta
+                if texto.startswith(CTRL):         # controle do servidor, nao e fala
+                    if "falar" in texto:
+                        self._suporta_falar = True
+                        print("[conversa] servidor sabe falar texto literal", flush=True)
+                elif texto:
                     self._nova_bolha("robo", texto)
+                else:                  # texto vazio = fim da resposta
+                    self._aguardando_desde = 0.0
+                    self._descartar_ate = 0.0      # a resposta acabou: a proxima toca normal
+                    self._fim.set()
             elif msg.tipo == AUDIO and msg.dados:
+                if self.descartando():
+                    print("[conversa] audio descartado (interrompido)", flush=True)
+                    continue
                 print("[conversa] audio recebido (%d bytes)" % len(msg.dados), flush=True)
                 with self._lock:
                     self._tocando += 1
@@ -167,20 +306,27 @@ class ClienteConversa:
             caminho = None
             try:
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                    f.write(wav)
+                    f.write(com_lead_in(wav))
                     caminho = f.name
                 for tentativa in (1, 2):
-                    r = subprocess.run(["paplay", "-d", self._sink, caminho], timeout=60,
-                                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                    if r.returncode == 0:
+                    tocador = subprocess.Popen(["paplay", "-d", self._sink, caminho],
+                                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    self._tocador = tocador
+                    try:
+                        _, erro = tocador.communicate(timeout=60)
+                    except subprocess.TimeoutExpired:
+                        tocador.kill()
+                        _, erro = tocador.communicate()
+                    if tocador.returncode == 0 or tocador.returncode < 0:   # <0: interrompido de proposito
                         break
-                    print("[conversa] paplay rc=%d: %s" % (r.returncode, r.stderr.decode(errors="replace").strip()), flush=True)
+                    print("[conversa] paplay rc=%d: %s" % (tocador.returncode, erro.decode(errors="replace").strip()), flush=True)
                     if tentativa == 1:     # PulseAudio pode ter caido: religa e tenta de novo
                         subprocess.run(["pulseaudio", "--start"], timeout=20,
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except (OSError, subprocess.SubprocessError) as e:
                 print("[conversa] falha ao tocar: %s" % e, flush=True)
             finally:
+                self._tocador = None
                 if caminho:
                     try:
                         os.remove(caminho)
