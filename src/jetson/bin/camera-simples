@@ -14,13 +14,14 @@
 #   ./camera-simples start --no-faces      desliga a deteccao de rosto
 #   ./camera-simples start --face-size 128 deteccao mais rapida/menos precisa
 #
-# Por que precisa disso em vez de so matar o processo: nessa Jetson, um
-# 'kill' comum (SIGTERM) no Camera_Simples.py NAO retorna (visto na pratica:
-# a chamada bloqueante do OpenNI2/GTK nao responde ao sinal) e, pior, deixa
-# o sensor PrimeSense num estado travado — a proxima tentativa de abrir a
-# camera fica pendurada indefinidamente. A unica saida confiavel encontrada:
-# matar com -9 e dar um reset USB por software (ioctl USBDEVFS_RESET) antes
-# de abrir de novo. Esse script automatiza os dois passos.
+# Por que precisa disso em vez de so matar o processo: nessa Jetson o sensor
+# PrimeSense fica travado se o app morrer sem fechar os streams (visto na
+# pratica: a proxima abertura pendura, e o audio USB para de aceitar 48 kHz).
+# Por isso o encerramento e em 2 tempos: SIGTERM primeiro (o app fecha os
+# streams sozinho, ~4 s, sem reset USB); so se nao sair em 10 s vai de -9 e
+# reset USB por software (ioctl USBDEVFS_RESET). Cuidado: o reset USB pode
+# deixar a profundidade/o mic mortos ate um replug fisico do cabo — por isso
+# ele so acontece quando o -9 foi necessario ou a abertura falhou.
 set -u
 
 DISP_NUM="$(ls /tmp/.X11-unix/ 2>/dev/null | sed -n 's/^X//p' | head -n1)"
@@ -76,13 +77,34 @@ status() {
     fi
 }
 
+# Encerra o app. Primeiro SIGTERM: o Camera_Simples.py trata o sinal e fecha os
+# streams do OpenNI2 no 'finally' (~4 s), o que deixa o sensor limpo — sem
+# reset USB. So se o processo nao sair em TIMEOUT_TERM_S (travado no OpenNI2/GTK)
+# vai de -9, e af sim o sensor fica sujo e precisa do reset USB. Com
+# "parar reset" (usado nas retentativas de abertura) o reset USB e sempre feito.
+TIMEOUT_TERM_S=10
 parar() {
-    pkill -9 -f "$APP" 2>/dev/null
-    # o -9 no processo principal nao mata o processo filho da deteccao de
-    # rosto (multiprocessing.spawn) nem o semaphore_tracker — ficam orfaos.
+    local forcar_reset="${1:-}" sujo=0 i
+    if pgrep -f "$APP" >/dev/null 2>&1; then
+        pkill -TERM -f "$APP" 2>/dev/null
+        for i in $(seq 1 "$TIMEOUT_TERM_S"); do
+            sleep 1
+            pgrep -f "$APP" >/dev/null 2>&1 || break
+        done
+        if pgrep -f "$APP" >/dev/null 2>&1; then
+            echo "app nao saiu com SIGTERM em ${TIMEOUT_TERM_S}s; matando com -9 (vai precisar de reset USB)." >&2
+            pkill -9 -f "$APP" 2>/dev/null
+            sujo=1
+        fi
+    fi
+    # orfaos: o filho da deteccao de rosto (multiprocessing.spawn), o
+    # semaphore_tracker e o worker do Vosk. Num encerramento limpo ja saíram.
     pkill -9 -f "$APPDIR/venv/bin/python.*multiprocessing" 2>/dev/null
-    sleep 1
-    resetar_usb
+    pkill -9 -f "$APPDIR/venv/bin/python.*stt_worker.py" 2>/dev/null
+    if [ "$sujo" = 1 ] || [ "$forcar_reset" = reset ]; then
+        sleep 1
+        resetar_usb
+    fi
 }
 
 # Espera o log mostrar que o sensor abriu de verdade ("Cor:" e' impresso depois
@@ -122,7 +144,7 @@ iniciar() {
             return 0
         fi
         echo "tentativa $tentativa: sensor nao abriu; resetando USB..." >&2
-        parar
+        parar reset
         sleep 5
     done
     echo "Falha ao abrir. Ultimas linhas de $LOG:" >&2
