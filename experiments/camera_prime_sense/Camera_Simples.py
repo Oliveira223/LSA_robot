@@ -39,6 +39,8 @@ from camera_utils import (HUD_AMARELO, HUD_CIANO, HudTela, MedidorDistancia,
                           configurar_cor, configurar_depth, criar_detector_rosto,
                           desenhar_alvos_hud, localizar_openni2_redist)
 
+from comandos import registrar_comandos
+from controle import ServidorControle
 from saudacao import Saudador
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -612,16 +614,26 @@ def main():
                 print(f"AVISO: transcricao indisponivel ({e}); seguindo sem janela de texto.",
                       file=sys.stderr)
 
-    saudador = None
-    if args.saudar:
-        if detector is None or medidor is None:
-            print("AVISO: --saudar precisa de deteccao de rosto e profundidade "
-                  "(sem --no-faces/--no-distancia); saudacao desligada.", file=sys.stderr)
-        else:
-            saudador = Saudador(args.saudar_texto, args.saudar_dist_min, args.saudar_dist_max,
-                               args.saudar_intervalo)
-            if transcritor is not None:
-                transcritor.definir_mudo_extra(saudador.falando)
+    # O Saudador sempre existe (o terminal `camera` pode ligar/desligar ao vivo);
+    # comeca ligado so com --saudar. Precisa de rostos + profundidade pra ter distancia.
+    saudavel = detector is not None and medidor is not None
+    if args.saudar and not saudavel:
+        print("AVISO: --saudar precisa de deteccao de rosto e profundidade "
+              "(sem --no-faces/--no-distancia); saudacao desligada.", file=sys.stderr)
+    saudador = Saudador(args.saudar_texto, args.saudar_dist_min, args.saudar_dist_max,
+                        args.saudar_intervalo, ativo=args.saudar and saudavel,
+                        disponivel=saudavel)
+    if transcritor is not None:
+        transcritor.definir_mudo_extra(saudador.falando)
+
+    servidor = ServidorControle()
+    registrar_comandos(servidor, args, saudador, ouvinte, transcritor, conversa,
+                       leitor_depth, detector)
+    try:
+        servidor.iniciar()
+    except OSError as e:
+        print("AVISO: canal de controle indisponivel (%s); o terminal `camera` nao vai "
+              "conseguir falar com o app." % e, file=sys.stderr)
 
     cliente_chat = None
     if args.stt == "pc" and ClienteChat is not None:
@@ -714,8 +726,7 @@ def main():
                                     (i, (x * fx, y * fy, w * fx, h * fy)) for (i, (x, y, w, h), _) in caixas])
                         except Exception as e:
                             print(f"AVISO: falha lendo profundidade ({e})", file=sys.stderr)
-                    if saudador is not None:
-                        saudador.atualizar(distancias)
+                    saudador.atualizar(distancias)
                     desenhar_alvos_hud(cor, alvos, distancias)
                 hud.desenhar(cor, len(alvos), detector is not None)
                 t0 = marca("hud", t0)
@@ -789,6 +800,7 @@ def main():
                 break
     finally:
         parar.set()
+        servidor.parar()
         produtor.join(timeout=2)
         if detector:
             detector.parar()

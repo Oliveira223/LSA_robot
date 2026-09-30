@@ -171,6 +171,11 @@ class ClienteTranscricao:
             if len(self._mensagens) > MAX_MENSAGENS:
                 self._mensagens.pop(0)
 
+    def enviar_texto(self, texto):
+        """Injeta `texto` como se tivesse sido falado (bolha do usuario + envio
+        ao cerebro). Usado pelo comando `digitar` do terminal `camera`."""
+        self._adicionar(texto)
+
     def _adicionar(self, texto):
         self.adicionar("usuario", texto)
         if self._conversa is not None:
