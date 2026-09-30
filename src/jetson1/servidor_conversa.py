@@ -10,6 +10,12 @@ e assim que cada uma fica pronta, o texto e o WAV falado (Piper):
     envia   TEXTO  frase 2     AUDIO  wav da frase 2   ...
     envia   TEXTO  ""          (fim da resposta)
 
+Falar texto literal (sem cerebro): ao conectar, o servidor manda um TEXTO de
+controle (comeca com "\\x00") dizendo "LSA1 falar". Se o cliente o recebeu, pode
+mandar TEXTO "\\x00falar:<texto>" e o servidor so sintetiza esse texto com o
+Piper (mesma voz das respostas), sem IA nem memoria, e fecha com TEXTO "".
+Servidor antigo nao manda o aviso — o cliente entao nem tenta.
+
 Quem toca o audio e a Jetson 2 (o alto-falante do robo esta la) — ver
 src/jetson/conversa_client.py. Este servidor nao usa microfone nem
 alto-falante.
@@ -51,6 +57,9 @@ except ImportError:                                  # rodando de dentro de src/
     from common.protocol import TEXTO, recv_msg, send_audio, send_texto
 
 PORTA_PADRAO = 5005
+CTRL = "\x00"                                       # TEXTO de controle (nunca e fala de verdade)
+HELLO = CTRL + "LSA1 falar"
+PREFIXO_FALAR = CTRL + "falar:"
 FRASE_PENSANDO = "deixa eu pensar..."
 FRASE_FINAL = "Até mais! Foi um prazer conversar com você."
 _FIM_FRASE = re.compile(r"(?<=[.!?])\s+")
@@ -150,6 +159,7 @@ def atender(conn, cerebro, tts):
             except Exception as e:                   # sem voz, o texto ainda aparece
                 print("[servidor] TTS falhou: %s" % e, flush=True)
 
+    send_texto(conn, HELLO)                           # avisa que sabe falar texto literal
     while True:
         msg = recv_msg(conn)
         if msg is None:
@@ -159,6 +169,13 @@ def atender(conn, cerebro, tts):
             continue
         pergunta = msg.texto.strip()
         if not pergunta:
+            continue
+        if pergunta.startswith(PREFIXO_FALAR):
+            literal = pergunta[len(PREFIXO_FALAR):].strip()
+            print("[servidor] falar (literal): %r" % literal, flush=True)
+            if literal:
+                enviar_frase(literal)
+            send_texto(conn, "")                      # fim
             continue
         t0 = time.time()
         print("[servidor] pergunta: %r" % pergunta, flush=True)

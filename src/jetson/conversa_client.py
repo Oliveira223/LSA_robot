@@ -38,6 +38,11 @@ import time
 
 from common.protocol import AUDIO, TEXTO, recv_msg, send_texto
 
+CTRL = "\x00"                          # TEXTO de controle do servidor (ver servidor_conversa.py)
+PREFIXO_FALAR = CTRL + "falar:"
+TIMEOUT_FALAR_S = 20.0
+TIMEOUT_RESPOSTA_S = 90.0               # depois disso `aguardando()` desiste
+
 HOST_PADRAO = "10.10.10.1"
 PORTA_PADRAO = 5005
 
@@ -70,6 +75,9 @@ class ClienteConversa:
         self._rodando = True
         self._tocando = 0                    # frases na fila de reproducao ou tocando
         self._mudo_ate = 0.0
+        self._suporta_falar = False          # servidor novo anuncia no hello
+        self._fim = threading.Event()        # setado quando chega o TEXTO vazio (fim da resposta)
+        self._aguardando_desde = 0.0         # !=0 enquanto espera o fim de uma resposta
         self._envio = queue.Queue()
         self._reproducao = queue.Queue()
         threading.Thread(target=self._loop_conexao, daemon=True).start()
@@ -83,12 +91,38 @@ class ClienteConversa:
     def falando(self):
         return self._tocando > 0 or time.time() < self._mudo_ate
 
+    def aguardando(self):
+        """True desde que uma pergunta foi enviada ate chegar o fim da resposta."""
+        desde = self._aguardando_desde
+        return bool(desde) and time.time() - desde < TIMEOUT_RESPOSTA_S
+
+    def suporta_falar(self):
+        return self._conectado and self._suporta_falar
+
+    def falar_literal(self, texto, timeout=TIMEOUT_FALAR_S):
+        """Pede a Jetson 1 pra falar `texto` com a voz do robo (Piper), sem passar
+        pelo cerebro, e espera terminar de tocar aqui. Devolve (ok, mensagem)."""
+        if not self._conectado:
+            return False, "Jetson 1 desconectada"
+        if not self._suporta_falar:
+            return False, ("o servidor da Jetson 1 e antigo e nao sabe falar texto literal "
+                           "(atualize servidor_conversa.py la e reinicie)")
+        self._fim.clear()
+        self._envio.put(PREFIXO_FALAR + texto)
+        if not self._fim.wait(timeout):
+            return False, "a Jetson 1 nao respondeu em %.0f s" % timeout
+        limite = time.time() + 60.0
+        while self.falando() and time.time() < limite:
+            time.sleep(0.1)
+        return True, "voz do robo (Piper, Jetson 1)"
+
     def enviar(self, texto):
         """Enfileira a pergunta. Se nao ha conexao, avisa e descarta (o robo
         nao vai responder uma pergunta de minutos atras quando voltar)."""
         if not self._conectado:
             self._nova_bolha("robo", "Estou sem conexão com o meu cérebro.")
             return
+        self._aguardando_desde = time.time()
         self._envio.put(texto)
 
     def _nova_bolha(self, autor, texto):
@@ -110,6 +144,8 @@ class ClienteConversa:
             espera = RECONEXAO_BACKOFF_S
             with self._lock:
                 self._sock = s
+            self._suporta_falar = False
+            self._aguardando_desde = 0.0
             self._conectado = True
             print("[conversa] conectado em %s:%d" % (self._host, self._porta), flush=True)
             try:
@@ -133,8 +169,15 @@ class ClienteConversa:
                 raise ConnectionError("Jetson 1 fechou a conexao")
             if msg.tipo == TEXTO:
                 texto = msg.texto.strip()
-                if texto:              # texto vazio = fim da resposta
+                if texto.startswith(CTRL):         # controle do servidor, nao e fala
+                    if "falar" in texto:
+                        self._suporta_falar = True
+                        print("[conversa] servidor sabe falar texto literal", flush=True)
+                elif texto:
                     self._nova_bolha("robo", texto)
+                else:                  # texto vazio = fim da resposta
+                    self._aguardando_desde = 0.0
+                    self._fim.set()
             elif msg.tipo == AUDIO and msg.dados:
                 print("[conversa] audio recebido (%d bytes)" % len(msg.dados), flush=True)
                 with self._lock:
