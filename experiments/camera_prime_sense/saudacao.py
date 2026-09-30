@@ -113,9 +113,10 @@ class Saudador:
                 if ok:
                     print("[saudacao] falando %r (%s)" % (texto, msg), flush=True)
                     return "falei %r (%s)" % (texto, msg)
-                self._cerebro_ruim_ate = time.time() + 30.0     # evita esperar timeout a cada fala
-                aviso = " [voz do robo indisponivel: %s]" % msg
-                print("[saudacao] voz do robo indisponivel: %s" % msg, flush=True)
+                if "nao respondeu" in msg:          # so o timeout e lento: evita repeti-lo a cada fala
+                    self._cerebro_ruim_ate = time.time() + 30.0
+                aviso = " [ATENCAO: fora da voz do robo: %s]" % msg
+                print("[saudacao] fora da voz do robo: %s" % msg, flush=True)
             nome, argv, env = self._comando(texto)
             print("[saudacao] falando %r (%s)" % (texto, nome), flush=True)
             r = subprocess.run(argv, env=env, timeout=30, stdin=subprocess.DEVNULL,

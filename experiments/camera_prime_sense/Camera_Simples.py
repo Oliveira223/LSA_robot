@@ -527,6 +527,9 @@ def main():
                      help="servidor de conversa na Jetson 1 (padrao %s:%d, pelo cabo). Cada frase "
                           "transcrita vai pra la e a resposta (texto + voz) volta; so vale com "
                           "--stt local" % (HOST_PADRAO, PORTA_PADRAO))
+    ap.add_argument("--chat-off", action="store_true",
+                     help="abre com a conversa por voz DESLIGADA: o microfone so transcreve e a fala "
+                          "nao vai ao cerebro (religue com `camera chat on`; `type` sempre responde)")
     ap.add_argument("--no-cerebro", action="store_true",
                      help="so transcreve, sem conversar com a Jetson 1")
     ap.add_argument("--no-chat", action="store_true",
@@ -617,6 +620,7 @@ def main():
                     conversa = ClienteConversa(host, int(porta or PORTA_PADRAO),
                                                ao_mensagem=transcritor.adicionar)
                     transcritor.definir_conversa(conversa)
+                    transcritor.conversa_ativa = not args.chat_off
             except ErroDeTranscricao as e:
                 print(f"AVISO: transcricao indisponivel ({e}); seguindo sem janela de texto.",
                       file=sys.stderr)

@@ -134,6 +134,7 @@ class ClienteTranscricao:
         self._estado = "carregando"
         self._parcial = ""
         self._conversa = None      # ClienteConversa (Jetson 1), opcional
+        self.conversa_ativa = True # False: a fala do mic so aparece na tela, nao vai ao cerebro
         self._mudo_extra = None
         self._estava_mudo = False
         self._rodando = True
@@ -203,12 +204,13 @@ class ClienteTranscricao:
 
     def enviar_texto(self, texto):
         """Injeta `texto` como se tivesse sido falado (bolha do usuario + envio
-        ao cerebro). Usado pelo comando `digitar` do terminal `camera`."""
-        self._adicionar(texto)
+        ao cerebro). Usado pelo comando `type` do terminal `camera`. Vai ao
+        cerebro mesmo com a conversa por voz desligada: digitar e pedir resposta."""
+        self._adicionar(texto, forcar=True)
 
-    def _adicionar(self, texto):
+    def _adicionar(self, texto, forcar=False):
         self.adicionar("usuario", texto)
-        if self._conversa is not None:
+        if self._conversa is not None and (self.conversa_ativa or forcar):
             self._conversa.enviar(texto)
 
     def _set(self, estado=None, parcial=None):

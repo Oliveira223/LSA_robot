@@ -8,6 +8,8 @@ ValueError vira mensagem de erro limpa pro usuario.
     falar <texto>                fala na caixa (testa a voz)
     digitar <texto>              injeta a frase como se tivesse sido falada
     reiniciar mic                recria o ouvinte do microfone dentro do app
+    chat [on|off]                liga/desliga o envio da fala do microfone ao cerebro
+    shush                        interrompe a fala do robo agora
     ouvir <seq>                  (interno) mensagens novas, pra transcrever/conversar
 
 Reiniciar/parar o app NAO passa por aqui: e feito pelo proprio `camera`
@@ -58,6 +60,10 @@ def registrar_comandos(servidor, args, saudador, mic, transcritor, conversa,
         if conversa is not None and conversa.conectado():
             linhas.append("voz: " + ("robo (Piper, Jetson 1)" if conversa.suporta_falar() else
                           "local (voz robotica; o servidor da Jetson 1 esta desatualizado)"))
+        if transcritor is not None and conversa is not None:
+            linhas.append("conversa por voz: " + ("LIGADA (o que o microfone ouve vai ao cerebro)"
+                          if transcritor.conversa_ativa else
+                          "desligada (o microfone so transcreve; `type` ainda responde)"))
         linhas.append("saudacao: " + _estado_saudacao(saudador))
         return "\n".join(linhas)
 
@@ -161,7 +167,31 @@ def registrar_comandos(servidor, args, saudador, mic, transcritor, conversa,
                            "aguardando": bool(conversa is not None and conversa.aguardando())},
                           ensure_ascii=False)
 
+    def cmd_chat(arg):
+        if transcritor is None or conversa is None:
+            raise ValueError("a conversa com o cerebro esta desligada (--no-cerebro, --stt off)")
+        acao = arg.strip().lower()
+        if acao in ("on", "off"):
+            transcritor.conversa_ativa = acao == "on"
+            if acao == "off":
+                conversa.interromper()          # desligar tambem corta o que o robo estiver falando
+        elif acao:
+            raise ValueError("uso: chat [on|off]")
+        return "conversa por voz: " + ("LIGADA" if transcritor.conversa_ativa else
+                                       "DESLIGADA (o microfone so transcreve; `type` ainda responde)")
+
+    def cmd_shush(_arg):
+        if conversa is None:
+            raise ValueError("nao ha conversa com o cerebro (--no-cerebro)")
+        if conversa.interromper():
+            return "interrompido"
+        if conversa.descartando():
+            return "nada tocando agora, mas a resposta ainda esta chegando: o resto do audio sera ignorado"
+        return "o robo nao estava falando"
+
     servidor.registrar("status", cmd_status)
+    servidor.registrar("chat", cmd_chat)
+    servidor.registrar("shush", cmd_shush)
     servidor.registrar("reiniciar_mic", cmd_reiniciar_mic)
     servidor.registrar("ouvir", cmd_ouvir)
     servidor.registrar("saudar", cmd_saudar)
