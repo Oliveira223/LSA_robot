@@ -30,6 +30,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 
 import cv2
 import numpy as np
@@ -574,6 +575,12 @@ def main():
     time.sleep(1.5)
     visual_som = VisualizadorSom()
 
+    def criar_ouvinte():
+        kwargs = {"ganho": args.mic_ganho, "silencio_s": args.mic_silencio}
+        if args.mic_limiar:
+            kwargs["limiar_fala"] = args.mic_limiar
+        return OuvinteVAD(**kwargs)
+
     ouvinte = None
     if args.mic_mock:
         if OuvinteMock is not None:
@@ -583,10 +590,7 @@ def main():
                   file=sys.stderr)
     elif not args.no_mic and OuvinteVAD is not None:
         try:
-            kwargs = {"ganho": args.mic_ganho, "silencio_s": args.mic_silencio}
-            if args.mic_limiar:
-                kwargs["limiar_fala"] = args.mic_limiar
-            ouvinte = OuvinteVAD(**kwargs)
+            ouvinte = criar_ouvinte()
         except ErroDeMic as e:
             print(f"AVISO: microfone indisponivel ({e}); seguindo sem indicador de mic.",
                   file=sys.stderr)
@@ -598,12 +602,15 @@ def main():
     if args.stt == "local" and not args.mic_mock:
         if ClienteTranscricao is None:
             pass  # o aviso do import ja foi impresso
-        elif ouvinte is None:
-            print("AVISO: sem microfone, seguindo sem janela de texto.", file=sys.stderr)
         else:
             try:
-                # mesmo OuvinteVAD do indicador de mic (so pode ter um arecord por vez)
-                transcritor = ClienteTranscricao(ouvinte=ouvinte)
+                # mesmo OuvinteVAD do indicador de mic (so pode ter um arecord por vez).
+                # Sem microfone o painel e a conversa continuam: da pra digitar pelo
+                # terminal `camera` (comando digitar/conversar).
+                if ouvinte is None:
+                    print("AVISO: sem microfone; a janela de texto funciona so por "
+                          "digitacao (terminal `camera`).", file=sys.stderr)
+                transcritor = ClienteTranscricao(ouvinte=ouvinte, sem_mic=ouvinte is None)
                 painel_texto = PainelTranscricao()
                 if not args.no_cerebro and ClienteConversa is not None:
                     host, _, porta = args.cerebro.partition(":")
@@ -626,9 +633,13 @@ def main():
     if transcritor is not None:
         transcritor.definir_mudo_extra(saudador.falando)
 
+    mic = types.SimpleNamespace(ouvinte=ouvinte)   # o `reiniciar mic` troca o ouvinte aqui
+    pode_reiniciar_mic = OuvinteVAD is not None and not args.no_mic and not args.mic_mock
     servidor = ServidorControle()
-    registrar_comandos(servidor, args, saudador, ouvinte, transcritor, conversa,
-                       leitor_depth, detector)
+    registrar_comandos(servidor, args, saudador, mic, transcritor, conversa,
+                       leitor_depth, detector,
+                       criar_ouvinte=criar_ouvinte if pode_reiniciar_mic else None,
+                       erro_de_mic=ErroDeMic)
     try:
         servidor.iniciar()
     except OSError as e:
@@ -732,8 +743,9 @@ def main():
                 t0 = marca("hud", t0)
 
                 quadro = cor
-                if ouvinte is not None:
-                    quadro = compor_hud_transparente(quadro, visual_som, ouvinte, canto=args.corner)
+                ouvinte_atual = mic.ouvinte
+                if ouvinte_atual is not None:
+                    quadro = compor_hud_transparente(quadro, visual_som, ouvinte_atual, canto=args.corner)
                 if cliente_chat:
                     quadro = desenhar_chat(quadro, cliente_chat.mensagens())
                 if transcritor:
@@ -810,8 +822,8 @@ def main():
             conversa.parar()
         if transcritor:
             transcritor.parar()
-        if ouvinte:
-            ouvinte.parar()
+        if mic.ouvinte:
+            mic.ouvinte.parar()
         if leitor_depth:
             leitor_depth.parar()
         parar_sensor(color_stream, depth_stream)

@@ -7,10 +7,13 @@ ValueError vira mensagem de erro limpa pro usuario.
     saudar [on|off|texto ...|dist MIN MAX|intervalo S]
     falar <texto>                fala na caixa (testa a voz)
     digitar <texto>              injeta a frase como se tivesse sido falada
+    reiniciar mic                recria o ouvinte do microfone dentro do app
+    ouvir <seq>                  (interno) mensagens novas, pra transcrever/conversar
 
 Reiniciar/parar o app NAO passa por aqui: e feito pelo proprio `camera`
 chamando o camera-simples, pra funcionar mesmo se o app estiver travado.
 """
+import json
 import os
 import time
 
@@ -19,8 +22,12 @@ def _faixa(s):
     return "%.1f a %.1f m" % (s.dist_min, s.dist_max)
 
 
-def registrar_comandos(servidor, args, saudador, ouvinte, transcritor, conversa,
-                       leitor_depth, detector):
+def registrar_comandos(servidor, args, saudador, mic, transcritor, conversa,
+                       leitor_depth, detector, criar_ouvinte=None, erro_de_mic=Exception):
+    """`mic` e um holder com o atributo `ouvinte` (o app le dele a cada quadro),
+    pra o comando `reiniciar mic` poder trocar o ouvinte sem reabrir o app.
+    `criar_ouvinte` e uma funcao sem argumentos que devolve um OuvinteVAD novo
+    (None quando o mic esta desligado por flag)."""
     inicio = time.time()
 
     def cmd_status(_arg):
@@ -38,21 +45,13 @@ def registrar_comandos(servidor, args, saudador, ouvinte, transcritor, conversa,
         else:
             linhas.append("rostos: %d no quadro" % len(detector.alvos()))
 
-        if ouvinte is None:
-            linhas.append("microfone: desligado")
-        else:
-            nivel, limiar, gravando, vivo = ouvinte.estado()
-            if not vivo:
-                linhas.append("microfone: OFFLINE (audio USB da PrimeSense travado; "
-                              "so um replug do cabo resolve)")
-            else:
-                linhas.append("microfone: ok (nivel %d, limiar %d%s)"
-                              % (nivel, limiar, ", captando fala" if gravando else ""))
+        linhas.append("microfone: " + _estado_mic(mic.ouvinte, criar_ouvinte is not None))
 
         if transcritor is None:
             linhas.append("transcricao: desligada")
         else:
-            linhas.append("transcricao: %s" % transcritor.estado())
+            linhas.append("transcricao: %s%s" % (
+                transcritor.estado(), "" if mic.ouvinte is not None else " (so texto, sem microfone)"))
         if conversa is not None:
             linhas.append("cerebro (Jetson 1): " + ("conectado" if conversa.conectado()
                                                      else "desconectado"))
@@ -114,10 +113,67 @@ def registrar_comandos(servidor, args, saudador, ouvinte, transcritor, conversa,
             return "enviado, mas a Jetson 1 (cerebro) esta desconectada: nao vai haver resposta"
         return "enviado ao cerebro: %r" % arg
 
+    def cmd_reiniciar_mic(_arg):
+        if criar_ouvinte is None:
+            raise ValueError("o microfone esta desligado neste modo (--no-mic ou --mic-mock)")
+        velho = mic.ouvinte
+        mic.ouvinte = None
+        if transcritor is not None:
+            transcritor.trocar_ouvinte(None)
+        if velho is not None:
+            velho.parar()                      # solta o arecord antes de abrir outro
+        try:
+            novo = criar_ouvinte()
+        except erro_de_mic as e:
+            raise ValueError("nao consegui abrir o microfone: %s" % e)
+        mic.ouvinte = novo
+        if transcritor is not None:
+            transcritor.trocar_ouvinte(novo)
+        # "vivo" sozinho engana (o ouvinte tenta religar 5x antes de desistir):
+        # confirma que chegou audio de verdade.
+        limite = time.time() + 8.0
+        while time.time() < limite:
+            if not novo.estado()[3]:
+                break
+            if len(novo.amostras_recentes()) > 0:
+                nivel = novo.estado()[0]
+                return "microfone religado e captando (nivel %d)" % nivel
+            time.sleep(0.3)
+        raise ValueError("o microfone nao voltou: nenhum audio chegou. O audio USB da "
+                         "PrimeSense esta travado (kernel: 'cannot set freq 48000 to ep 0x84'); "
+                         "so um replug do cabo resolve. Enquanto isso, use 'digitar'/'conversar'.")
+
+    def cmd_ouvir(arg):
+        if transcritor is None:
+            raise ValueError("a transcricao esta desligada (--stt off)")
+        try:
+            seq = int(arg or "-1")
+        except ValueError:
+            raise ValueError("uso: ouvir <seq>")
+        if seq < 0:                            # primeira chamada: so ancora no "agora"
+            return json.dumps({"seq": transcritor.registro_desde(0)[0], "itens": [], "parcial": ""})
+        ultimo, itens, parcial = transcritor.registro_desde(seq)
+        return json.dumps({"seq": ultimo, "itens": itens, "parcial": parcial},
+                          ensure_ascii=False)
+
     servidor.registrar("status", cmd_status)
+    servidor.registrar("reiniciar_mic", cmd_reiniciar_mic)
+    servidor.registrar("ouvir", cmd_ouvir)
     servidor.registrar("saudar", cmd_saudar)
     servidor.registrar("falar", cmd_falar)
     servidor.registrar("digitar", cmd_digitar)
+
+
+def _estado_mic(ouvinte, pode_reiniciar):
+    if ouvinte is None:
+        return "indisponivel" + (" (tente: reiniciar mic)" if pode_reiniciar else " (desligado)")
+    nivel, limiar, gravando, vivo = ouvinte.estado()
+    if not vivo:
+        return ("OFFLINE (o ouvinte desistiu de religar; audio USB da PrimeSense travado - "
+                "so um replug do cabo resolve)")
+    if len(ouvinte.amostras_recentes()) == 0:
+        return "SEM AUDIO chegando (tentando religar; se persistir, replugue o cabo USB)"
+    return "ok (nivel %d, limiar %d%s)" % (nivel, limiar, ", captando fala" if gravando else "")
 
 
 def _estado_saudacao(s):
