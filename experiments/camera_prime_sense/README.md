@@ -42,11 +42,27 @@ Permite alternar entre os sensores de profundidade, infravermelho e cor, exibir 
 | `listen` | mostra ao vivo o que o microfone ouve e as respostas do robô (Ctrl+C sai) |
 | `restart mic` | recria o ouvinte do microfone dentro do app e confere se chegou áudio; se o áudio USB da PrimeSense travou, avisa que só um replug resolve |
 | `start [flags]`, `restart [flags]`, `stop` | abrem/reiniciam/encerram o app pelo `camera-simples` (SIGTERM primeiro, sem reset USB) |
-| `log [all]` | acompanha o log sem o ruído de profundidade e falas descartadas |
+| `log [all\|important\|today [N]\|days\|day <data> [N]]` | logs com data, hora e cor, ao vivo ou por dia (veja *Logs* abaixo) |
 
 A saudação começa desligada; `--saudar` a abre ligada. Módulos: `controle.py` (servidor do socket), `comandos.py` (os comandos), `saudacao.py`. Sem microfone (`--no-mic` ou mic indisponível na abertura) a janela de texto e a conversa continuam funcionando por digitação.
 
 **Voz do robô (`say` e saudação):** o Piper só existe na Jetson 1, então ela sintetiza o texto e esta Jetson toca. Isso exige o `src/jetson1/servidor_conversa.py` novo na Jetson 1 (copie e reinicie o servidor). Com o servidor antigo, o `status` mostra "voz: local" e o `say` cai para o `spd-say` (voz robótica, pouco confiável dentro do app), avisando o motivo.
+
+## Logs
+
+O app imprime cada evento com data, hora, **nível** e **tag**, sem que cada `print` do projeto precise mudar (`camera_log.py` envolve `stdout`/`stderr`):
+
+```
+2026-09-30 15:36:46 INFO  [saudacao] falando 'teste do log' (voz do robo (Piper, Jetson 1))
+2026-09-30 15:36:48 WARN  [mic_vad] desisti de religar o arecord — mic offline
+```
+
+Níveis: `DEBUG` (ruído: quadros de profundidade, falas descartadas, áudio recebido), `INFO`, `WARN` e `ERROR`. Dois destinos:
+
+- **Sessão** (`/tmp/camera-simples.log`, recriado a cada abertura): tudo, com o ruído como `DEBUG`.
+- **Arquivo por dia** (`logs/camera/AAAA-MM-DD.log`, fora do git, guardado por 30 dias): só o que importa, isto é, avisos e erros (inclusive tracebacks), conexões com a Jetson 1, frases reconhecidas, respostas do robô, saudações, comandos do terminal `camera` e início/fim do app. Linhas iguais e seguidas viram "(a linha acima se repetiu mais N vezes)".
+
+`camera log` mostra tudo isso com cores (vermelho = erro, amarelo = aviso, cinza = ruído, uma cor por tag nos eventos). Sem argumento acompanha a sessão sem o ruído; `log all` inclui o ruído; `log important` acompanha o arquivo de hoje; `log today [N]`, `log days` e `log day AAAA-MM-DD [N]` leem os arquivos diários. A pasta pode ser trocada com `CAMERA_LOG_DIR`.
 
 ## Requisitos
 

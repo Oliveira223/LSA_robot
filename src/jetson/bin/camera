@@ -18,6 +18,7 @@ So biblioteca padrao (Python 3.6 da Jetson).
 import cmd
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -38,7 +39,12 @@ TIMEOUT_FALAR_S = 100.0   # `say` espera a fala terminar de tocar
 TIMEOUT_RESPOSTA_S = 95.0 # `type <texto>` espera a resposta do robo
 # apaga a linha atual (prompt/parcial) — so em terminal de verdade
 LIMPA = "\r\033[K" if sys.stdout.isatty() else ""
-RUIDO_DO_LOG = ("depth:", "[transcritor] descartado")
+LOGS_DIR = os.environ.get("CAMERA_LOG_DIR") or os.path.expanduser("~/dev/LSA_robot/logs/camera")
+# formato que o app grava (experiments/camera_prime_sense/camera_log.py)
+FORMATO_LOG = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) (DEBUG|INFO |WARN |ERROR) \[([A-Za-z0-9_]+)\] (.*)$")
+_COR_NIVEL = {"ERROR": "\033[1;31m", "WARN ": "\033[33m", "DEBUG": "\033[2m"}
+_COR_TAG = {"saudacao": "\033[35m", "conversa": "\033[36m", "controle": "\033[36m",
+            "transcritor": "\033[32m", "app": "\033[1m"}
 
 # subcomandos em ingles -> o que o app entende (o app fala portugues por dentro)
 SUBCOMANDOS_GREET = {"text": "texto", "interval": "intervalo"}
@@ -95,6 +101,47 @@ def _imprimir_no_prompt(linha, prompt):
     digitado = readline.get_line_buffer() if readline else ""
     sys.stdout.write(LIMPA + linha + "\n" + prompt + digitado)
     sys.stdout.flush()
+
+
+def _pintar(linha):
+    """Cor por nivel (erro vermelho, aviso amarelo, ruido apagado) e, em INFO, por tag.
+    So em terminal de verdade; linha fora do formato (saida crua de bibliotecas) fica apagada."""
+    if not sys.stdout.isatty():
+        return linha
+    m = FORMATO_LOG.match(linha)
+    if not m:
+        return "\033[2m" + linha + "\033[0m"
+    cor = _COR_NIVEL.get(m.group(2)) or _COR_TAG.get(m.group(3))
+    return (cor + linha + "\033[0m") if cor else linha
+
+
+def _mostrar(linha, tudo):
+    """Imprime a linha se passar no filtro: sem `tudo`, esconde DEBUG e linhas fora do formato."""
+    m = FORMATO_LOG.match(linha)
+    if not tudo and (not m or m.group(2) == "DEBUG"):
+        return
+    print(_pintar(linha), flush=True)
+
+
+def _arquivo_do_dia(dia):
+    return os.path.join(LOGS_DIR, dia + ".log")
+
+
+def _hoje():
+    return time.strftime("%Y-%m-%d")
+
+
+def _seguir(caminho, tudo):
+    """tail -F de `caminho` mostrando as linhas (filtradas e coloridas) ate Ctrl+C."""
+    proc = subprocess.Popen(["tail", "-n", "30", "-F", caminho], stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, universal_newlines=True, bufsize=1)
+    try:
+        for linha in proc.stdout:
+            _mostrar(linha.rstrip("\n"), tudo)
+    except KeyboardInterrupt:
+        print()
+    finally:
+        proc.terminate()
 
 
 def launcher(*argumentos):
@@ -391,27 +438,73 @@ class Terminal(cmd.Cmd):
         return launcher("stop")
 
     def do_log(self, arg):
-        """log [all] - acompanha o log do app ao vivo (equivale a um tail -f). Ctrl+C volta.
+        """log [all|important|today [N]|days|day <AAAA-MM-DD> [N]] - logs do app, com data, hora e cor.
 
-        Por padrao esconde o ruido (uma linha "depth:" a cada 5 s e falas descartadas pelo
-        reconhecedor). `log all` mostra tudo. Mostra erros, avisos e eventos como
-        "[saudacao] falando ..." e "[conversa] conectado ...". Util em um segundo terminal
-        enquanto voce usa o primeiro."""
-        tudo = arg.strip() in ("all", "tudo")
-        if not os.path.exists(LOG):
-            print("erro: sem log em %s (o app ja foi aberto?)" % LOG)
-            return 1
-        proc = subprocess.Popen(["tail", "-n", "30", "-F", LOG], stdout=subprocess.PIPE,
-                                universal_newlines=True, bufsize=1)
-        try:
-            for linha in proc.stdout:
-                if tudo or not linha.startswith(RUIDO_DO_LOG):
-                    print(linha, end="", flush=True)
-        except KeyboardInterrupt:
-            print()
-        finally:
-            proc.terminate()
-        return None
+        Cada linha tem data, hora, NIVEL e [tag]:  2026-09-30 15:42:10 INFO  [saudacao] falando ...
+        Cores: vermelho = ERROR, amarelo = WARN, cinza = ruido (DEBUG); em INFO, uma cor por tag.
+
+        Ao vivo (Ctrl+C volta ao prompt):
+          log              sessao atual sem o ruido (esconde DEBUG: quadros de profundidade, falas
+                           descartadas, audio recebido...)
+          log all          sessao atual, tudo (inclui DEBUG e a saida crua das bibliotecas)
+          log important    arquivo de hoje ao vivo: so avisos, erros e eventos importantes
+
+        Arquivo por dia (logs/camera/AAAA-MM-DD.log, guardados 30 dias; so o que importa: avisos,
+        erros, conexoes, frases reconhecidas, saudacoes, comandos do terminal, inicio/fim do app):
+          log today [N]    ultimas N linhas de hoje (padrao 60)
+          log days         lista os dias com registro
+          log day 2026-09-30 [N]   ultimas N linhas de um dia"""
+        partes = arg.split()
+        modo = partes[0] if partes else ""
+        if modo in ("", "all", "tudo"):
+            if not os.path.exists(LOG):
+                print("erro: sem log em %s (o app ja foi aberto?)" % LOG)
+                return 1
+            return _seguir(LOG, tudo=modo != "")
+        if modo == "important":
+            caminho = _arquivo_do_dia(_hoje())
+            if not os.path.exists(caminho):
+                print("(ainda sem registros hoje; aguardando...)")
+                open(caminho, "a").close() if os.path.isdir(LOGS_DIR) else None
+            return _seguir(caminho, tudo=True)
+        if modo == "days":
+            arquivos = sorted(f for f in os.listdir(LOGS_DIR) if re.match(r"^\d{4}-\d\d-\d\d\.log$", f)) \
+                if os.path.isdir(LOGS_DIR) else []
+            if not arquivos:
+                print("sem registros em %s" % LOGS_DIR)
+                return 1
+            for f in arquivos:
+                with open(os.path.join(LOGS_DIR, f), encoding="utf-8", errors="replace") as fh:
+                    n = sum(1 for _ in fh)
+                print("%s  %5d linhas" % (f[:-4], n))
+            return None
+        if modo in ("today", "day"):
+            if modo == "day":
+                if len(partes) < 2 or not re.match(r"^\d{4}-\d\d-\d\d$", partes[1]):
+                    print("uso: log day AAAA-MM-DD [N]")
+                    return 1
+                dia, resto = partes[1], partes[2:]
+            else:
+                dia, resto = _hoje(), partes[1:]
+            try:
+                n = int(resto[0]) if resto else 60
+            except ValueError:
+                print("erro: N precisa ser um numero")
+                return 1
+            caminho = _arquivo_do_dia(dia)
+            if not os.path.exists(caminho):
+                print("sem registros em %s" % dia)
+                return 1
+            with open(caminho, encoding="utf-8", errors="replace") as fh:
+                ultimas = fh.read().splitlines()[-n:]
+            for linha in ultimas:
+                print(_pintar(linha))
+            return None
+        print("uso: log [all|important|today [N]|days|day <AAAA-MM-DD> [N]]")
+        return 1
+
+    def complete_log(self, texto, linha, inicio, fim):
+        return [o for o in ("all", "important", "today", "days", "day") if o.startswith(texto)]
 
     VISAO_GERAL = """\
 Conversar com o robo
@@ -429,7 +522,7 @@ Ver e ajustar (sem reiniciar nada)
 O app da camera
   start [flags]       abre o app         stop         encerra o app
   restart [...]       reinicia o app, ou `restart mic` so o microfone
-  log [all]           acompanha o log do app ao vivo
+  log [...]           logs com data, hora e cor: ao vivo ou por dia (`help log`)
 
 exit                  fecha este terminal (o app continua rodando)
 
