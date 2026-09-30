@@ -27,6 +27,21 @@ Permite alternar entre os sensores de profundidade, infravermelho e cor, exibir 
 - **Resolução:** o sensor é consultado em runtime e a cor usa 640×480@30 por padrão (medido: 29 fps reais). 1280×1024 é anunciado a 30 fps mas entrega ~5 fps (limite do USB 2.0) e trava se combinado com profundidade; só com `--res 1280x1024`.
 - **Leveza:** o realce (CLAHE + unsharp) roda no tamanho de exibição, sem filtro bilateral; a profundidade não usa mais `inpaint` (fechamento morfológico no lugar); redimensionamento com INTER_LINEAR.
 
+## Terminal de controle (`camera`)
+
+`camera` (`src/jetson/bin/camera`, atalho em `~/.local/bin/camera`) controla o app em execução por um socket Unix (`/tmp/camera.sock`), sem reiniciar nada. Sem argumentos abre um terminal interativo; com argumento roda um comando e sai (`camera saudar on`).
+
+| Comando | O que faz |
+|---|---|
+| `status` | estado de câmera, profundidade, rostos, microfone (com diagnóstico), cérebro e saudação |
+| `saudar [on\|off\|texto <frase>\|dist <min> <max>\|intervalo <s>]` | liga/desliga e ajusta o "bom dia" por proximidade, ao vivo |
+| `falar <texto>` | o robô fala o texto na caixa |
+| `digitar <texto>` | injeta a frase como se tivesse sido falada (vai ao cérebro) |
+| `iniciar [flags]`, `reiniciar [flags]`, `parar` | abrem/reiniciam/encerram o app pelo `camera-simples` (SIGTERM primeiro, sem reset USB) |
+| `log [tudo]` | acompanha o log sem o ruído de profundidade e falas descartadas |
+
+A saudação começa desligada; `--saudar` a abre ligada. Módulos: `controle.py` (servidor do socket), `comandos.py` (os comandos), `saudacao.py`.
+
 ## Requisitos
 
 ### Hardware
