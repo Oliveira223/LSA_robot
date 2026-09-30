@@ -29,6 +29,15 @@ Permite alternar entre os sensores de profundidade, infravermelho e cor, exibir 
 
 ## Terminal de controle (`camera`)
 
+**Instalação (uma vez por Jetson):** os atalhos não são versionados, então crie os links em `~/.local/bin` (já está no `PATH` depois do login):
+
+```
+ln -sf ~/dev/LSA_robot/src/jetson/bin/camera        ~/.local/bin/camera
+ln -sf ~/dev/LSA_robot/src/jetson/bin/camera-simples ~/.local/bin/camera-simples
+```
+
+O `camera-simples` (launcher) abre/encerra o app e espera a PrimeSense aparecer no USB; o `camera` é o terminal de controle. Para a voz do robô, atualize também o `servidor_conversa.py` na Jetson 1 (veja *Voz do robô* abaixo).
+
 `camera` (`src/jetson/bin/camera`, atalho em `~/.local/bin/camera`) controla o app em execução por um socket Unix (`/tmp/camera.sock`), sem reiniciar nada. Sem argumentos abre um terminal interativo; com argumento roda um comando e sai (`camera greet on`). Os comandos são em inglês (os nomes antigos em português continuam funcionando, fora do `help`).
 
 | Comando | O que faz |
