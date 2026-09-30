@@ -25,7 +25,9 @@ set -u
 
 DISP_NUM="$(ls /tmp/.X11-unix/ 2>/dev/null | sed -n 's/^X//p' | head -n1)"
 DISP=":${DISP_NUM:-0}"
-APPDIR="$HOME/dev/Camera-prime-sense"
+APPDIR="$HOME/dev/LSA_robot/experiments/camera_prime_sense"
+# runtime do OpenNI2 extraido do .deb (sem sudo); Camera_Simples.py le OPENNI2_REDIST
+[ -d "$HOME/dev/openni2-redist" ] && export OPENNI2_REDIST="$HOME/dev/openni2-redist"
 PY="$APPDIR/venv/bin/python"
 APP="$APPDIR/Camera_Simples.py"
 LOG="/tmp/camera-simples.log"
@@ -83,6 +85,19 @@ parar() {
     resetar_usb
 }
 
+# Espera o log mostrar que o sensor abriu de verdade ("Cor:" e' impresso depois
+# de abrir + configurar o stream). Devolve 1 se o processo morreu ou travou
+# (sensor pendurado nao imprime nada e fica com 0% de CPU).
+esperar_sensor() {
+    local i
+    for i in $(seq 1 25); do
+        sleep 1
+        pgrep -f "$APP" >/dev/null 2>&1 || return 1
+        grep -q "^Cor:" "$LOG" 2>/dev/null && return 0
+    done
+    return 1
+}
+
 iniciar() {
     if [ ! -x "$PY" ] || [ ! -f "$APP" ]; then
         echo "ERRO: nao encontrei $PY ou $APP" >&2
@@ -93,16 +108,26 @@ iniciar() {
         return 0
     fi
     cd "$APPDIR" || exit 1
-    nohup "$PY" -u "$APP" "$@" >"$LOG" 2>&1 &
-    disown
-    sleep 4
-    if pgrep -f "$APP" >/dev/null 2>&1; then
-        echo "Tela aberta na Jetson (DISPLAY $DISP). Log: $LOG"
-    else
-        echo "Falha ao abrir. Ultimas linhas de $LOG:" >&2
-        tail -n 20 "$LOG" >&2
-        exit 1
-    fi
+    local tentativa
+    for tentativa in 1 2 3; do
+        # O PulseAudio (autostart no login) fica sondando a interface de audio
+        # da PrimeSense e trava (usb_set_interface -110 no dmesg), o que deixa
+        # o OpenNI2 pendurado ao abrir o video. Ele renasce sozinho quando o
+        # mic pedir (pactl) — so precisa estar fora do caminho na abertura.
+        pkill -9 pulseaudio 2>/dev/null
+        nohup "$PY" -u "$APP" "$@" >"$LOG" 2>&1 &
+        disown
+        if esperar_sensor; then
+            echo "Tela aberta na Jetson (DISPLAY $DISP). Log: $LOG"
+            return 0
+        fi
+        echo "tentativa $tentativa: sensor nao abriu; resetando USB..." >&2
+        parar
+        sleep 5
+    done
+    echo "Falha ao abrir. Ultimas linhas de $LOG:" >&2
+    tail -n 20 "$LOG" >&2
+    exit 1
 }
 
 case "${1:-}" in

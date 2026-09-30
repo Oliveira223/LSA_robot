@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Chamado pelo autostart do login. Mostra uma tela "AGUARDANDO A CAMERA" e
+# insiste ate a PrimeSense aparecer NO USB e ficar estavel, so entao abre o
+# app (camera-simples start). Desiste depois de LIMITE_S segundos, deixando
+# na tela a instrucao pra replugar o cabo.
+#
+# A PrimeSense as vezes trava no reboot (dmesg: "device descriptor read,
+# error -110") e so volta com replug fisico do USB — por isso a tela de
+# espera diz o que fazer, e o loop continua tentando: replugar o cabo
+# enquanto a tela esta aberta ja basta, sem reiniciar nada.
+DIR="$(cd "$(dirname "$0")" && pwd)"
+APPDIR="$HOME/dev/LSA_robot/experiments/camera_prime_sense"
+STATUS="/tmp/c2gelsa-status"
+LIMITE_S=900
+
+[ -d "$HOME/dev/openni2-redist" ] && export OPENNI2_REDIST="$HOME/dev/openni2-redist"
+DISP_NUM="$(ls /tmp/.X11-unix/ 2>/dev/null | sed -n 's/^X//p' | head -n1)"
+export DISPLAY=":${DISP_NUM:-0}"
+for f in "$HOME/.Xauthority" "/run/user/$(id -u)/gdm/Xauthority"; do
+    [ -f "$f" ] && { export XAUTHORITY="$f"; break; }
+done
+
+tem_camera() { grep -qs 1d27 /sys/bus/usb/devices/*/idVendor; }
+status() { printf '%b\n' "$1" > "$STATUS"; }
+
+# so o pontinho de status ja da pra ver o boot andando; o resto espera o desktop
+sleep 8
+status "AGUARDANDO A CAMERA...\nCONECTE O CABO USB DA PRIMESENSE"
+( cd "$APPDIR" && exec nohup "$APPDIR/venv/bin/python" -u Camera_Simples.py --espera \
+      >/tmp/c2gelsa-espera.log 2>&1 ) &
+ESPERA=$!
+
+inicio=$SECONDS
+while [ $((SECONDS - inicio)) -lt "$LIMITE_S" ]; do
+    if ! tem_camera; then
+        status "AGUARDANDO A CAMERA...\nCONECTE O CABO USB DA PRIMESENSE"
+        sleep 3
+        continue
+    fi
+    # so segue se a camera ficar 8 s seguidos no USB (ela as vezes aparece e cai)
+    estavel=1
+    for _ in 1 2 3 4; do
+        sleep 2
+        tem_camera || { estavel=0; break; }
+    done
+    if [ "$estavel" != 1 ]; then
+        status "CAMERA INSTAVEL NO USB\nREPLUGUE O CABO DA PRIMESENSE"
+        sleep 3
+        continue
+    fi
+    status "CAMERA DETECTADA\nINICIANDO..."
+    if "$DIR/camera-simples" start; then
+        sleep 3            # deixa a janela do app aparecer antes de tirar a de espera
+        kill "$ESPERA" 2>/dev/null
+        exit 0
+    fi
+    status "FALHA AO ABRIR A CAMERA\nREPLUGUE O CABO USB - TENTANDO DE NOVO..."
+    sleep 10
+done
+status "CAMERA NAO ENCONTRADA\nREPLUGUE O USB E REINICIE A JETSON"
