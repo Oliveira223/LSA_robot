@@ -94,6 +94,21 @@ def _achar_source(nome_dispositivo=NOME_DISPOSITIVO_PADRAO, fallback=None):
     return fallback
 
 
+def preparar_mic(nome_dispositivo=NOME_DISPOSITIVO_PADRAO, card_fallback=CARD_FALLBACK):
+    """Grava 1 s descartada ANTES de abrir o video da camera (OpenNI2).
+
+    A interface de audio da PrimeSense so aceita o ajuste da taxa de amostragem
+    (48000 Hz) enquanto o video nao esta rodando: com o video ativo o kernel
+    loga "cannot set freq 48000 to ep 0x84" e o arecord falha de vez (visto na
+    pratica 2026-09-29: o mic funcionou todas as vezes que um arecord curto
+    rodou antes do app e falhou todas as vezes que o app abriu direto). Depois
+    que a taxa ja foi configurada uma vez, o driver nao pede de novo e o
+    arecord abre normalmente mesmo com o video ligado."""
+    card = _achar_card(nome_dispositivo, card_fallback)
+    _rodar(["arecord", "-q", "-D", "hw:%s,0" % card, "-f", "S16_LE",
+            "-r", str(TAXA), "-c", str(CANAIS), "-d", "1", "-t", "raw", "/dev/null"])
+
+
 def _aplicar_ganho(card, ganho, numids=NUMIDS_GANHO_PADRAO):
     for numid in numids:
         _rodar(["amixer", "-c", card, "cset", "numid=%s" % numid, str(ganho)])
@@ -127,6 +142,7 @@ class OuvinteVAD:
         self._limiar = limiar_fala
         self._silencio_s = silencio_s
         self._ganho = ganho
+        self._ao_audio = None
 
         if numids_ganho:
             _aplicar_ganho(self._card, ganho, numids_ganho)
@@ -180,6 +196,22 @@ class OuvinteVAD:
         for pedaco in pedacos:
             amostras.extend(pedaco)
         return amostras
+
+    def definir_ao_audio(self, funcao):
+        """Registra funcao(evento, dados) chamada na thread do mic, sem
+        bloquear (so enfileirar!): ("inicio", bytes com o pre-roll + 1o pedaco),
+        ("chunk", bytes de ~50 ms) enquanto a fala continua e ("fim", None) ao
+        fechar a frase. Audio cru S16_LE 48 kHz estereo. Serve pra transcrever
+        enquanto a pessoa ainda fala em vez de so depois da frase."""
+        self._ao_audio = funcao
+
+    def _avisar(self, evento, dados):
+        funcao = self._ao_audio
+        if funcao is not None:
+            try:
+                funcao(evento, dados)
+            except Exception as e:
+                print("[mic_vad] callback de audio falhou: %s" % e, flush=True)
 
     def _loop(self):
         pre_roll = []
@@ -236,9 +268,11 @@ class OuvinteVAD:
                     buffer = list(pre_roll)
                     silencio_acumulado = 0.0
                     duracao_fala = len(buffer) * CHUNK_S
+                    self._avisar("inicio", b"".join(buffer))
                 continue
 
             buffer.append(pedaco)
+            self._avisar("chunk", pedaco)
             duracao_fala += CHUNK_S
             if nivel < self._limiar:
                 silencio_acumulado += CHUNK_S
@@ -247,6 +281,7 @@ class OuvinteVAD:
 
             if silencio_acumulado >= self._silencio_s or duracao_fala >= MAX_FALA_S:
                 gravando = False
+                self._avisar("fim", None)
                 self._fila.put(self._empacotar(buffer))
                 buffer = []
                 pre_roll = []
