@@ -33,10 +33,16 @@ CANAIS = 2
 LARGURA = 2  # bytes por amostra (S16_LE)
 
 GANHO_PADRAO = 1700       # 0-4182; default de fabrica (3576) satura em voz normal
-LIMIAR_FALA = 600         # RMS acima disso = "esta falando" (ajuste se precisar)
+LIMIAR_FALA = 600         # RMS minimo pra "esta falando" (sala silenciosa)
+# Com gente conversando em volta o fundo fica em 500-2000 de RMS e passava do
+# limiar fixo o tempo todo: a frase so fechava no teto de 20 s (visto 2026-10-01).
+# Agora o limiar acompanha o ambiente: FATOR_AMBIENTE x mediana do volume nos
+# ultimos AMBIENTE_S (nunca abaixo de LIMIAR_FALA), congelado durante a frase.
+FATOR_AMBIENTE = 2.5
+AMBIENTE_S = 3.0
 SILENCIO_S = 0.8          # silencio continuo por isso pra fechar a frase
 PRE_ROLL_S = 0.3          # comeco preservado antes do limiar disparar
-MAX_FALA_S = 20.0         # teto de seguranca — fecha a frase mesmo sem silencio
+MAX_FALA_S = 10.0         # teto de seguranca — fecha a frase mesmo sem silencio
 CHUNK_S = 0.05            # granularidade de leitura/deteccao (~50 ms)
 HISTORICO_AUDIO_S = 2.0   # quanto de audio cru fica disponivel pra HUD (forma de onda)
 N_CHUNKS_HISTORICO = max(1, int(HISTORICO_AUDIO_S / CHUNK_S))
@@ -57,11 +63,13 @@ TIMEOUT_CMD_S = 3  # arecord/pactl/amixer as vezes travam de verdade nessa
                     # aqui, um comando travado prendia o app inteiro pra
                     # sempre, antes ate de abrir a janela.
 
+TIMEOUT_PREPARO_MIC_S = 20
 
-def _rodar(cmd):
+
+def _rodar(cmd, timeout=TIMEOUT_CMD_S):
     try:
         return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               timeout=TIMEOUT_CMD_S)
+                               timeout=timeout)
     except subprocess.TimeoutExpired:
         print("[mic_vad] comando travou (%s) — seguindo com o fallback"
               % " ".join(cmd), flush=True)
@@ -105,8 +113,12 @@ def preparar_mic(nome_dispositivo=NOME_DISPOSITIVO_PADRAO, card_fallback=CARD_FA
     que a taxa ja foi configurada uma vez, o driver nao pede de novo e o
     arecord abre normalmente mesmo com o video ligado."""
     card = _achar_card(nome_dispositivo, card_fallback)
+    # timeout maior que o padrao: logo apos o USB reenumerar o driver demora a
+    # responder e abortar aqui em 3 s deixava a taxa sem configurar (mic offline
+    # pro resto da sessao, visto 2026-09-30).
     _rodar(["arecord", "-q", "-D", "hw:%s,0" % card, "-f", "S16_LE",
-            "-r", str(TAXA), "-c", str(CANAIS), "-d", "1", "-t", "raw", "/dev/null"])
+            "-r", str(TAXA), "-c", str(CANAIS), "-d", "1", "-t", "raw", "/dev/null"],
+           timeout=TIMEOUT_PREPARO_MIC_S)
 
 
 def _aplicar_ganho(card, ganho, numids=NUMIDS_GANHO_PADRAO):
@@ -220,6 +232,8 @@ class OuvinteVAD:
         buffer = []
         silencio_acumulado = 0.0
         duracao_fala = 0.0
+        ambiente = deque(maxlen=int(AMBIENTE_S / CHUNK_S))
+        limiar_base = self._limiar
 
         reconexoes = 0
         while self._rodando:
@@ -259,7 +273,14 @@ class OuvinteVAD:
                 self._gravando_atual = gravando
                 self._historico_audio.append(mono)
 
+            # o ambiente e medido sempre (inclusive gravando): com conversa em volta
+            # o detector grava sem parar e nunca juntaria AMBIENTE_S so de fundo
+            ambiente.append(nivel)
             if not gravando:
+                if len(ambiente) >= ambiente.maxlen // 3:
+                    mediana = sorted(ambiente)[len(ambiente) // 2]
+                    with self._estado_lock:
+                        self._limiar = max(limiar_base, int(FATOR_AMBIENTE * mediana))
                 pre_roll.append(pedaco)
                 if len(pre_roll) > tam_pre_roll:
                     pre_roll.pop(0)

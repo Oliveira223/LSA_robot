@@ -515,7 +515,7 @@ def main():
     ap.add_argument("--mic-ganho", type=int, default=2300,
                      help="ganho de captura do mic da PrimeSense, 0-4182 (padrao 2300; "
                           "o do mic_vad e 1700 e exigia falar alto; 3576 de fabrica satura)")
-    ap.add_argument("--mic-silencio", type=float, default=0.6,
+    ap.add_argument("--mic-silencio", type=float, default=1.0,
                      help="segundos de silencio pra fechar a frase (padrao 0.6)")
     ap.add_argument("--mic-mock", action="store_true",
                      help="grafico de onda com dados SIMULADOS (jetson.mic_mock), sem "
@@ -563,6 +563,7 @@ def main():
           flush=True)
 
     detector = None if args.no_faces else criar_detector_rosto(args.face_size, args.face_conf)
+    rosto = types.SimpleNamespace(detector=detector)   # o comando `faces` liga/desliga aqui
 
     # OpenNI2 abre a interface de video da PrimeSense PRIMEIRO, sem nada mais
     # mexendo no mesmo dispositivo USB ao mesmo tempo — visto na pratica
@@ -648,7 +649,8 @@ def main():
     pode_reiniciar_mic = OuvinteVAD is not None and not args.no_mic and not args.mic_mock
     servidor = ServidorControle()
     registrar_comandos(servidor, args, saudador, mic, transcritor, conversa,
-                       leitor_depth, detector,
+                       leitor_depth, rosto,
+                       criar_detector=lambda: criar_detector_rosto(args.face_size, args.face_conf),
                        criar_ouvinte=criar_ouvinte if pode_reiniciar_mic else None,
                        erro_de_mic=ErroDeMic)
     try:
@@ -726,6 +728,7 @@ def main():
                 t0 = marca("resize", t0)
 
                 alvos = []
+                detector = rosto.detector
                 if detector:
                     # o YOLO recebe o frame da camera (reduzido la dentro); o rastreio
                     # por fluxo optico roda a cada frame. Caixas voltam em coordenadas
@@ -826,8 +829,8 @@ def main():
         parar.set()
         servidor.parar()
         produtor.join(timeout=2)
-        if detector:
-            detector.parar()
+        if rosto.detector:
+            rosto.detector.parar()
         if cliente_chat:
             cliente_chat.parar()
         if conversa:

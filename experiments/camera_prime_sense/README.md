@@ -47,6 +47,7 @@ O `camera-simples` (launcher) abre/encerra o app e espera a PrimeSense aparecer 
 | `say [texto]` | o robô fala o texto com a **voz dele** (Piper, a mesma das respostas). Sem texto abre o prompt `say> `, que fala cada linha digitada |
 | `type [pergunta]` | digita para o robô como se tivesse sido falado (vai ao cérebro). Com a pergunta, envia e mostra a resposta. Sem argumento abre o prompt `type> `, onde tudo que você digita vai ao cérebro e as respostas aparecem |
 | `shush` | interrompe a fala do robô agora (corta o áudio e descarta o resto da resposta) |
+| `brain [ollama\|claude\|modelo X]` | escolhe quem responde: o Ollama da Jetson 1 (padrão) ou o Claude Code local (veja *Cérebro Claude* abaixo) |
 | `chat [on\|off]` | liga/desliga a conversa por voz: desligada, o microfone só transcreve e o robô não responde ao ambiente (`type` e `say` continuam funcionando). `--chat-off` abre já desligada |
 | `listen` | mostra ao vivo o que o microfone ouve e as respostas do robô (Ctrl+C sai) |
 | `restart mic` | recria o ouvinte do microfone dentro do app e confere se chegou áudio; se o áudio USB da PrimeSense travou, avisa que só um replug resolve |
@@ -56,6 +57,21 @@ O `camera-simples` (launcher) abre/encerra o app e espera a PrimeSense aparecer 
 A saudação começa desligada; `--saudar` a abre ligada. Módulos: `controle.py` (servidor do socket), `comandos.py` (os comandos), `saudacao.py`. Sem microfone (`--no-mic` ou mic indisponível na abertura) a janela de texto e a conversa continuam funcionando por digitação.
 
 **Voz do robô (`say` e saudação):** o Piper só existe na Jetson 1, então ela sintetiza o texto e esta Jetson toca. Isso exige o `src/jetson1/servidor_conversa.py` novo na Jetson 1 (copie e reinicie o servidor). Com o servidor antigo, o `status` mostra "voz: local" e o `say` cai para o `spd-say` (voz robótica, pouco confiável dentro do app), avisando o motivo.
+
+## Cérebro Claude (teste, sem API)
+
+Por padrão quem responde é o Ollama da Jetson 1. O comando `brain claude` troca, enquanto o app roda, para uma sessão do **Claude Code local** (`claude -p`, usa o login da máquina, sem API key), que roda aqui na Jetson 2. A voz continua sendo o Piper da Jetson 1, então ela precisa estar ligada com o `servidor_conversa.py`; sem ela a resposta só aparece como texto. Não precisa do Ollama.
+
+```
+brain                 mostra quem responde (também aparece em `status`)
+brain claude          liga e aquece a sessão (~10 s); depois cada resposta leva ~2 s
+brain ollama          volta pro Ollama
+brain modelo sonnet   troca o modelo (padrão haiku; reabre a sessão)
+```
+
+Vale só enquanto o app roda: ao reiniciar volta para o Ollama. Um processo `claude` fica aberto (`src/jetson/cerebro_claude.py`) e guarda a conversa inteira; o texto chega em streaming e cada frase já vai pra voz. Não usa as respostas locais do `brain.py` (contas, despedida) nem grava no `memoria.db`.
+
+**Como ensinar / dar contexto:** edite `src/jetson/contexto_claude.md` (texto livre: quem o robô é, o tom, fatos do laboratório, o que não fazer) e rode `brain claude` de novo: o arquivo só é lido ao abrir a sessão. Como a resposta é falada, mantenha o pedido de frases curtas, sem markdown/emojis/listas, e de dizer "não sei" em vez de inventar. Dizer algo no `type>` ("meu nome é Pedro") também vale, mas só até reiniciar o app ou rodar `brain claude` de novo; o que deve ficar vai no arquivo.
 
 ## Logs
 

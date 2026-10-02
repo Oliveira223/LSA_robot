@@ -338,6 +338,24 @@ class Terminal(cmd.Cmd):
         finally:
             parar.set()
 
+    def do_brain(self, arg):
+        """brain [ollama|claude|modelo <nome>] - escolhe QUEM RESPONDE ao robo.
+
+          brain              mostra quem esta respondendo
+          brain claude       as perguntas vao pro Claude Code local (`claude -p`, sem API key,
+                             roda aqui na Jetson 2); a voz continua sendo o Piper da Jetson 1
+          brain ollama       volta pro Ollama da Jetson 1 (padrao)
+          brain modelo X     modelo do Claude (haiku, sonnet, opus; padrao haiku)
+
+        O contexto (quem o robo e, como responder) fica em src/jetson/contexto_claude.md e e
+        lido ao (re)abrir a sessao: depois de editar, rode `brain claude` de novo. A sessao fica
+        aberta e lembra a conversa toda; ligar leva ~10 s (aquecimento), depois cada resposta
+        leva ~2 s. Vale so enquanto o app roda."""
+        return self._remoto("brain", arg)
+
+    def complete_brain(self, texto, linha, inicio, fim):
+        return [o for o in ("ollama", "claude", "modelo") if o.startswith(texto)]
+
     def do_shush(self, arg):
         """shush - interrompe a fala do robo AGORA.
 
@@ -362,6 +380,20 @@ class Terminal(cmd.Cmd):
         return self._remoto("chat", arg)
 
     def complete_chat(self, texto, linha, inicio, fim):
+        return [o for o in ("on", "off") if o.startswith(texto)]
+
+    def do_faces(self, arg):
+        """faces [on|off] - liga/desliga a DETECCAO DE ROSTO sem reiniciar o app.
+
+          faces        mostra se esta ligada
+          faces off    encerra o processo do detector (libera GPU, CPU e memoria): some a
+                       caixa dos rostos, a distancia deles e a saudacao
+          faces on     volta a detectar (leva alguns segundos pra carregar o modelo)
+
+        Abrir ja desligada: start --no-faces. Vale so enquanto o app roda."""
+        return self._remoto("faces", arg)
+
+    def complete_faces(self, texto, linha, inicio, fim):
         return [o for o in ("on", "off") if o.startswith(texto)]
 
     def do_listen(self, arg):
@@ -513,10 +545,12 @@ Conversar com o robo
                       Sem pergunta: modo type> (chat)
   listen              mostra ao vivo o que o microfone ouve
   shush               interrompe a fala do robo agora
+  brain [ollama|claude]  escolhe quem responde: Ollama (Jetson 1) ou Claude Code local
   chat [on|off]       liga/desliga a conversa por voz (o que o microfone ouve vai ao cerebro?)
 
 Ver e ajustar (sem reiniciar nada)
   status              estado de camera, profundidade, rostos, microfone, cerebro e voz
+  faces [on|off]      liga/desliga a deteccao de rosto (desligada nao pesa na GPU/CPU)
   greet [...]         liga/desliga e ajusta o "bom dia" quando um rosto chega perto
 
 O app da camera

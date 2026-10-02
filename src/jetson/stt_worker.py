@@ -22,15 +22,58 @@ todos sao acumulados (so pegar o ultimo perdia o comeco da frase).
 
 Compatibilidade: Python 3.6 da Jetson.
 
+Frases da visita: se existir jetson/gramatica.json (gerado por
+gerar_gramatica.py a partir dos gatilhos do repertorio da Jetson 1), o Vosk
+so reconhece aquelas frases e o resto vira [unk] (descartado). Com gente
+conversando em volta isso troca "frase inventada" por "nao ouvi nada" e
+acerta melhor as perguntas conhecidas; perguntas livres (Ollama) por voz
+deixam de funcionar. LSA_VOSK_GRAMATICA=off desliga; =<arquivo> usa outro.
+
 Uso (a partir de src/, so pra teste manual):
     LD_LIBRARY_PATH=... python -m jetson.stt_worker <pasta-do-modelo>
 """
 
 import json
+import os
+import re
 import struct
 import sys
 
 TAXA = 16000
+GRAMATICA_PADRAO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gramatica.json")
+# a sigla falada sai soletrada; o repertorio da Jetson 1 espera "lsa"
+_SIGLAS = [(re.compile(r"\b[eé]le [eé]sse [aá]\b"), "lsa")]
+
+
+class _Gramatica:
+    """Rele o arquivo quando ele muda (gerar_gramatica.py de novo vale na proxima
+    frase, sem reiniciar o app — reiniciar costuma travar o mic da PrimeSense)."""
+
+    def __init__(self):
+        self._caminho = os.environ.get("LSA_VOSK_GRAMATICA") or GRAMATICA_PADRAO
+        self._mtime, self._texto = None, None
+
+    def atual(self):
+        if self._caminho == "off" or not os.path.isfile(self._caminho):
+            return None
+        mtime = os.path.getmtime(self._caminho)
+        if mtime != self._mtime:
+            self._mtime = mtime
+            try:
+                with open(self._caminho, encoding="utf-8") as f:
+                    texto = f.read()
+                json.loads(texto)          # arquivo pela metade/invalido: fica com a anterior
+                self._texto = texto
+            except (OSError, ValueError):
+                pass
+        return self._texto
+
+
+def _limpar(texto):
+    texto = " ".join(p for p in texto.split() if p != "[unk]")
+    for padrao, troca in _SIGLAS:
+        texto = padrao.sub(troca, texto)
+    return texto
 
 
 def _ler_exato(f, n):
@@ -48,6 +91,7 @@ def main():
 
     SetLogLevel(-1)
     modelo = Model(sys.argv[1])
+    gramatica = _Gramatica()
     entrada = sys.stdin.buffer
     saida = sys.stdout.buffer
     saida.write(b"PRONTO\n")
@@ -58,11 +102,12 @@ def main():
     confs = []       # confianca de cada palavra desses segmentos
 
     def fechar_segmento(r):
-        t = (r.get("text") or "").strip()
+        t = _limpar((r.get("text") or "").strip())
         if t:
             textos.append(t)
         for p in r.get("result") or []:
-            confs.append(p.get("conf", 0.0))
+            if p.get("word") != "[unk]":
+                confs.append(p.get("conf", 0.0))
 
     def responder(obj):
         saida.write((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
@@ -78,7 +123,11 @@ def main():
             return
 
         if cmd == b"S":
-            rec = KaldiRecognizer(modelo, TAXA)
+            g = gramatica.atual()
+            try:
+                rec = KaldiRecognizer(modelo, TAXA, g) if g else KaldiRecognizer(modelo, TAXA)
+            except Exception:
+                rec = KaldiRecognizer(modelo, TAXA)
             rec.SetWords(True)
             del textos[:], confs[:]
         elif cmd == b"C" and rec is not None:
@@ -86,7 +135,7 @@ def main():
                 fechar_segmento(json.loads(rec.Result()))
                 parcial = ""
             else:
-                parcial = json.loads(rec.PartialResult()).get("partial", "")
+                parcial = _limpar(json.loads(rec.PartialResult()).get("partial", ""))
             responder({"parcial": " ".join(textos + ([parcial] if parcial else []))})
         elif cmd == b"E" and rec is not None:
             fechar_segmento(json.loads(rec.FinalResult()))

@@ -9,6 +9,7 @@ ValueError vira mensagem de erro limpa pro usuario.
     digitar <texto>              injeta a frase como se tivesse sido falada
     reiniciar mic                recria o ouvinte do microfone dentro do app
     chat [on|off]                liga/desliga o envio da fala do microfone ao cerebro
+    brain [ollama|claude|modelo X]  troca quem responde: Ollama (Jetson 1) ou Claude Code local
     shush                        interrompe a fala do robo agora
     ouvir <seq>                  (interno) mensagens novas, pra transcrever/conversar
 
@@ -25,11 +26,14 @@ def _faixa(s):
 
 
 def registrar_comandos(servidor, args, saudador, mic, transcritor, conversa,
-                       leitor_depth, detector, criar_ouvinte=None, erro_de_mic=Exception):
+                       leitor_depth, rosto, criar_detector=None, criar_ouvinte=None,
+                       erro_de_mic=Exception):
     """`mic` e um holder com o atributo `ouvinte` (o app le dele a cada quadro),
     pra o comando `reiniciar mic` poder trocar o ouvinte sem reabrir o app.
     `criar_ouvinte` e uma funcao sem argumentos que devolve um OuvinteVAD novo
-    (None quando o mic esta desligado por flag)."""
+    (None quando o mic esta desligado por flag).
+    `rosto` e um holder com o atributo `detector` (o app le dele a cada quadro),
+    pra o comando `faces` desligar/religar a deteccao de rosto sem reabrir o app."""
     inicio = time.time()
 
     def cmd_status(_arg):
@@ -42,6 +46,7 @@ def registrar_comandos(servidor, args, saudador, mic, transcritor, conversa,
             linhas.append("profundidade: " + ("ok" if ok else
                           "SEM QUADROS (distancia indisponivel; replugue o cabo USB)"))
 
+        detector = rosto.detector
         if detector is None:
             linhas.append("rostos: detector desligado")
         else:
@@ -57,6 +62,8 @@ def registrar_comandos(servidor, args, saudador, mic, transcritor, conversa,
         if conversa is not None:
             linhas.append("cerebro (Jetson 1): " + ("conectado" if conversa.conectado()
                                                      else "desconectado"))
+        if conversa is not None:
+            linhas.append("quem responde: " + _estado_brain(conversa))
         if conversa is not None and conversa.conectado():
             linhas.append("voz: " + ("robo (Piper, Jetson 1)" if conversa.suporta_falar() else
                           "local (voz robotica; o servidor da Jetson 1 esta desatualizado)"))
@@ -180,6 +187,38 @@ def registrar_comandos(servidor, args, saudador, mic, transcritor, conversa,
         return "conversa por voz: " + ("LIGADA" if transcritor.conversa_ativa else
                                        "DESLIGADA (o microfone so transcreve; `type` ainda responde)")
 
+    def cmd_faces(arg):
+        acao = arg.strip().lower()
+        if acao == "off" and rosto.detector is not None:
+            detector, rosto.detector = rosto.detector, None   # o app para de usar ja no proximo quadro
+            detector.parar()                                  # encerra o processo (libera GPU/CPU/RAM)
+            print("[rosto] deteccao desligada pelo terminal", flush=True)
+        elif acao == "on" and rosto.detector is None:
+            if criar_detector is None:
+                raise ValueError("deteccao de rosto indisponivel neste app")
+            rosto.detector = criar_detector()
+            if rosto.detector is None:
+                raise ValueError("nao achei o modelo de rosto (veja o log)")
+            print("[rosto] deteccao ligada pelo terminal", flush=True)
+        elif acao not in ("", "on", "off"):
+            raise ValueError("uso: faces [on|off]")
+        return "deteccao de rosto: " + ("LIGADA" if rosto.detector is not None else
+                                        "DESLIGADA (sem caixas, distancia nem saudacao)")
+
+    def cmd_brain(arg):
+        if conversa is None:
+            raise ValueError("nao ha conversa com o cerebro (--no-cerebro)")
+        partes = arg.split()
+        if partes and partes[0].lower() == "modelo":
+            if len(partes) != 2:
+                raise ValueError("uso: brain modelo <haiku|sonnet|opus|id>")
+            conversa.modelo_claude(partes[1])
+        elif partes:
+            if len(partes) != 1 or partes[0].lower() not in ("ollama", "claude"):
+                raise ValueError("uso: brain [ollama|claude|modelo <nome>]")
+            conversa.definir_cerebro(partes[0].lower())
+        return _estado_brain(conversa)
+
     def cmd_shush(arg):
         if arg:
             raise ValueError("shush nao tem argumentos: ele so corta a fala de agora (a proxima "
@@ -194,12 +233,20 @@ def registrar_comandos(servidor, args, saudador, mic, transcritor, conversa,
 
     servidor.registrar("status", cmd_status)
     servidor.registrar("chat", cmd_chat)
+    servidor.registrar("faces", cmd_faces)
+    servidor.registrar("brain", cmd_brain)
     servidor.registrar("shush", cmd_shush)
     servidor.registrar("reiniciar_mic", cmd_reiniciar_mic)
     servidor.registrar("ouvir", cmd_ouvir)
     servidor.registrar("saudar", cmd_saudar)
     servidor.registrar("falar", cmd_falar)
     servidor.registrar("digitar", cmd_digitar)
+
+
+def _estado_brain(conversa):
+    if conversa.cerebro() == "claude":
+        return "CLAUDE CODE local (modelo %s; a voz ainda e o Piper da Jetson 1)" % conversa.modelo_claude()
+    return "Ollama (Jetson 1)"
 
 
 def _estado_mic(ouvinte, pode_reiniciar):

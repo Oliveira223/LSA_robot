@@ -40,6 +40,7 @@ import threading
 import time
 import wave
 
+from jetson.cerebro_claude import SessaoClaude
 from common.protocol import AUDIO, TEXTO, recv_msg, send_texto
 
 CTRL = "\x00"                          # TEXTO de controle do servidor (ver servidor_conversa.py)
@@ -130,10 +131,15 @@ class ClienteConversa:
         self._tocador = None                 # paplay em andamento (pra poder interromper)
         self._envio = queue.Queue()
         self._reproducao = queue.Queue()
+        self._cerebro = "ollama"             # ou "claude" (ver definir_cerebro)
+        self._claude = SessaoClaude()
+        self._claude_fila = queue.Queue()
+        self._claude_cancelar = False
         threading.Thread(target=self._vigiar_keepalive, daemon=True).start()
         threading.Thread(target=self._loop_conexao, daemon=True).start()
         threading.Thread(target=self._loop_envio, daemon=True).start()
         threading.Thread(target=self._loop_reproducao, daemon=True).start()
+        threading.Thread(target=self._loop_claude, daemon=True).start()
 
     # ── consulta ───────────────────────────────────────────────────────
     def conectado(self):
@@ -164,6 +170,7 @@ class ClienteConversa:
         resto do audio da resposta em curso (o texto continua chegando). Devolve quantas
         frases foram descartadas."""
         descartadas = 0
+        self._claude_cancelar = True
         with self._lock:
             if self.aguardando():        # so ha o que descartar se a resposta ainda esta chegando
                 self._descartar_ate = time.time() + TIMEOUT_RESPOSTA_S
@@ -187,7 +194,33 @@ class ClienteConversa:
     def suporta_falar(self):
         return self._conectado and self._suporta_falar
 
-    def falar_literal(self, texto, timeout=TIMEOUT_FALAR_S):
+    def cerebro(self):
+        return self._cerebro
+
+    def definir_cerebro(self, modo):
+        """"claude" (re)abre a sessao (relendo o contexto) e a aquece em segundo plano."""
+        if modo not in ("ollama", "claude"):
+            raise ValueError("cerebro desconhecido: %r" % modo)
+        self._cerebro = modo
+        if modo == "claude":
+            threading.Thread(target=self._aquecer_claude, daemon=True).start()
+        else:
+            self._claude.parar()
+
+    def modelo_claude(self, modelo=None):
+        if modelo:
+            self._claude.modelo = modelo
+            if self._cerebro == "claude":
+                self.definir_cerebro("claude")          # reabre com o modelo novo
+        return self._claude.modelo
+
+    def _aquecer_claude(self):
+        try:
+            self._claude.iniciar()
+        except Exception as e:                          # noqa: BLE001
+            print("[conversa] claude nao aqueceu: %s" % e, flush=True)
+
+    def falar_literal(self, texto, timeout=TIMEOUT_FALAR_S, esperar_tocar=True):
         """Pede a Jetson 1 pra falar `texto` com a voz do robo (Piper), sem passar
         pelo cerebro, e espera terminar de tocar aqui. Devolve (ok, mensagem)."""
         if not self._conectado:
@@ -202,18 +235,46 @@ class ClienteConversa:
             self._descartar_ate = time.time() + TIMEOUT_RESPOSTA_S   # fala atrasada nao toca por cima
             return False, "a Jetson 1 nao respondeu em %.0f s" % timeout
         limite = time.time() + 60.0
-        while self.falando() and time.time() < limite:
+        while esperar_tocar and self.falando() and time.time() < limite:
             time.sleep(0.1)
         return True, "voz do robo (Piper, Jetson 1)"
 
     def enviar(self, texto):
         """Enfileira a pergunta. Se nao ha conexao, avisa e descarta (o robo
         nao vai responder uma pergunta de minutos atras quando voltar)."""
+        if self._cerebro == "claude":
+            self._aguardando_desde = time.time()
+            self._claude_cancelar = False
+            self._claude_fila.put(texto)
+            return
         if not self._conectado:
             self._nova_bolha("robo", "Estou sem conexão com o meu cérebro.")
             return
         self._aguardando_desde = time.time()
         self._envio.put(texto)
+
+    def _falar_frase_claude(self, frase):
+        # O servidor da Jetson 1 devolve a frase falada como TEXTO + AUDIO, e esse TEXTO ja
+        # vira a bolha (em _receber): criar outra aqui duplicaria. So sem voz a bolha e daqui.
+        if self._conectado and self._suporta_falar:
+            ok, _ = self.falar_literal(frase, esperar_tocar=False)
+            if ok:
+                return
+        self._nova_bolha("robo", frase)
+
+    def _loop_claude(self):
+        while self._rodando:
+            try:
+                pergunta = self._claude_fila.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            try:
+                self._claude.perguntar(pergunta, self._falar_frase_claude,
+                                       cancelado=lambda: self._claude_cancelar)
+            except Exception as e:                          # noqa: BLE001 - vira fala de erro
+                print("[conversa] claude: %s" % e, flush=True)
+                self._falar_frase_claude("Desculpe, tive um problema para pensar nisso.")
+            self._aguardando_desde = 0.0
 
     def _nova_bolha(self, autor, texto):
         print("[conversa] %s: %s" % (autor, texto), flush=True)
@@ -338,6 +399,7 @@ class ClienteConversa:
 
     def parar(self):
         self._rodando = False
+        self._claude.parar()
         with self._lock:
             s = self._sock
         if s is not None:

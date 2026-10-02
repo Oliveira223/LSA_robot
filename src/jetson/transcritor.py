@@ -42,20 +42,23 @@ import queue
 import threading
 import time
 
-try:
-    import numpy as np
-except ImportError:  # pragma: no cover
-    np = None
-
+from jetson.audio_prep import PreProcessador
 from jetson.mic_vad import ErroDeMic, OuvinteVAD
 
 MAX_MENSAGENS = 8
-TAXA_STT = 16000
 
 CHUNK_S = 0.05           # tamanho dos pedacos do OuvinteVAD
 DURACAO_MIN_S = 0.3      # trecho FALADO minimo (pedacos acima de PICO_MIN_RMS/2)
 PICO_MIN_RMS = 800       # volume (RMS de pedacos de 50 ms) que a frase precisa atingir
-CONF_MIN = 0.5           # confianca media das palavras (0-1) abaixo disso = descarta
+CONF_MIN = 0.7           # confianca media das palavras (0-1) abaixo disso = descarta
+AUDIO_DEBUG_DIR = os.path.expanduser(os.environ.get("LSA_AUDIO_DEBUG") or "~/dev/audio_debug")
+AUDIO_DEBUG_MAX = 150    # quantos WAVs guardar (os mais antigos saem)
+# Palavra unica so vale se for uma dessas (o resto e quase sempre o comeco de uma frase
+# cortada ou ruido que o Vosk transformou em palavra).
+PALAVRAS_SOLTAS_OK = frozenset([
+    "oi", "olá", "ola", "tchau", "obrigado", "obrigada", "valeu", "sim", "não", "nao",
+    "pare", "para", "silêncio", "silencio", "piada",
+])
 
 # O que o Vosk "escuta" em ruido: interjeicoes e palavras soltas curtas.
 INTERJEICOES = frozenset([
@@ -86,16 +89,27 @@ def _env_worker():
     return env
 
 
-def _para_16k_mono(dados):
-    """Pedaco S16_LE 48 kHz estereo -> PCM S16_LE 16 kHz mono. Faz a media de
-    3 amostras (filtro passa-baixa simples) antes de decimar; o ratecv do
-    audioop pega 1 a cada 3 sem filtrar e o chiado aliasado atrapalha o Vosk."""
-    mono = audioop.tomono(dados, 2, 0.5, 0.5)
-    if np is None:
-        return audioop.ratecv(mono, 2, 1, 48000, TAXA_STT, None)[0]
-    x = np.frombuffer(mono, dtype=np.int16)
-    n = len(x) // 3 * 3
-    return (x[:n].reshape(-1, 3).astype(np.int32).sum(axis=1) // 3).astype(np.int16).tobytes()
+def _salvar_audio_debug(pedacos, texto, conf, pico, aceito):
+    """Guarda o WAV cru (48 kHz estereo) de cada frase capturada, com o que o Vosk
+    entendeu no nome, pra ouvir depois e ajustar ganho/limiar com dados reais."""
+    try:
+        import wave
+        os.makedirs(AUDIO_DEBUG_DIR, exist_ok=True)
+        limpo = "".join(c if c.isalnum() else "_" for c in (texto or "vazio"))[:40]
+        nome = "%s_%s_c%.2f_p%d_%s.wav" % (time.strftime("%H%M%S"), "ok" if aceito else "descartado",
+                                           conf, pico, limpo)
+        with wave.open(os.path.join(AUDIO_DEBUG_DIR, nome), "wb") as w:
+            w.setnchannels(2)
+            w.setsampwidth(2)
+            w.setframerate(48000)
+            w.writeframes(b"".join(pedacos))
+        # por data de modificacao: o nome comeca com HHMMSS e vira a meia-noite
+        antigos = sorted((os.path.join(AUDIO_DEBUG_DIR, n) for n in os.listdir(AUDIO_DEBUG_DIR)),
+                         key=os.path.getmtime)
+        for velho in antigos[:-AUDIO_DEBUG_MAX]:
+            os.remove(velho)
+    except Exception as e:
+        print("[transcritor] nao salvou audio de debug: %s" % e, flush=True)
 
 
 def _so_interjeicoes(texto):
@@ -265,6 +279,27 @@ class ClienteTranscricao:
         return json.loads(linha.decode("utf-8"))
 
     def _loop(self):
+        """Religa o worker do Vosk se ele cair (antes a transcricao morria ate
+        reiniciar o app — e reiniciar o app costuma travar o mic da PrimeSense)."""
+        falhas = 0
+        while self._rodando:
+            inicio = time.time()
+            self._sessao()
+            if not self._rodando:
+                break
+            if self._proc is not None:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+            falhas = 0 if time.time() - inicio > 60 else falhas + 1
+            if falhas >= 5:
+                print("[transcritor] o Vosk caiu 5 vezes seguidas; desisti", flush=True)
+                return
+            print("[transcritor] religando o Vosk...", flush=True)
+            time.sleep(2)
+
+    def _sessao(self):
         try:
             self._iniciar_worker()
         except (ErroDeTranscricao, OSError) as e:
@@ -276,6 +311,8 @@ class ClienteTranscricao:
 
         ativa = False
         pico = falados = 0
+        audio_frase = []
+        prep = PreProcessador()   # filtros + AGC com estado; reiniciado a cada frase
         try:
             while self._rodando:
                 try:
@@ -289,7 +326,9 @@ class ClienteTranscricao:
                     continue
                 if evento == "inicio":
                     self._pedir(b"S")
+                    prep.resetar()
                     ativa, pico, falados = True, 0, 0
+                    audio_frase = []
                     evento = "chunk"
                 if evento == "chunk" and ativa:
                     # junta o que ja estiver na fila num envio so (se o Vosk
@@ -305,12 +344,13 @@ class ClienteTranscricao:
                         else:               # inicio/fim: volta pra fila em ordem
                             self._eventos.queue.appendleft((ev2, d2))
                             break
+                    audio_frase.extend(pedacos)
                     for p in pedacos:
                         for i in range(0, len(p), 9600):
                             r = audioop.rms(p[i:i + 9600], 2)
                             pico = max(pico, r)
                             falados += r >= PICO_MIN_RMS / 2
-                    resp = self._pedir(b"C", _para_16k_mono(b"".join(pedacos)))
+                    resp = self._pedir(b"C", prep.processar(b"".join(pedacos)))
                     parcial = resp.get("parcial", "")
                     self._set(parcial=parcial if parcial and not _so_interjeicoes(parcial) else "")
                 elif evento == "fim" and ativa:
@@ -320,10 +360,15 @@ class ClienteTranscricao:
                     self._set(parcial="")
                     texto, conf = resp.get("texto", ""), float(resp.get("conf", 0.0))
                     dur = falados * CHUNK_S
+                    palavras = texto.lower().split()
+                    solta = len(palavras) == 1 and palavras[0] not in PALAVRAS_SOLTAS_OK
+                    aceito = not (dur < DURACAO_MIN_S or pico < PICO_MIN_RMS or not texto
+                                  or conf < CONF_MIN or _so_interjeicoes(texto) or solta)
+                    _salvar_audio_debug(audio_frase, texto, conf, pico, aceito)
                     if dur < DURACAO_MIN_S or pico < PICO_MIN_RMS:
                         print("[transcritor] descartado (ruido) falado=%.2fs pico=%d texto=%r" % (
                             dur, pico, texto), flush=True)
-                    elif not texto or conf < CONF_MIN or _so_interjeicoes(texto):
+                    elif not texto or conf < CONF_MIN or _so_interjeicoes(texto) or solta:
                         print("[transcritor] descartado %r conf=%.2f falado=%.2fs pico=%d" % (
                             texto, conf, dur, pico), flush=True)
                     else:
