@@ -30,11 +30,15 @@
 # ele so acontece quando o -9 foi necessario ou a abertura falhou.
 set -u
 
+# PC (x86_64, webcam em vez da PrimeSense): nao ha USB da PrimeSense pra esperar/resetar
+# nem PulseAudio da Jetson pra matar. LSA_PERFIL=jetson|pc forca um dos dois.
+PERFIL="${LSA_PERFIL:-$([ "$(uname -m)" = aarch64 ] && echo jetson || echo pc)}"
+
 DISP_NUM="$(ls /tmp/.X11-unix/ 2>/dev/null | sed -n 's/^X//p' | head -n1)"
 DISP=":${DISP_NUM:-0}"
 APPDIR="$HOME/dev/LSA_robot/experiments/camera_prime_sense"
 # runtime do OpenNI2 extraido do .deb (sem sudo); Camera_Simples.py le OPENNI2_REDIST
-[ -d "$HOME/dev/openni2-redist" ] && export OPENNI2_REDIST="$HOME/dev/openni2-redist"
+[ "$PERFIL" = jetson ] && [ -d "$HOME/dev/openni2-redist" ] && export OPENNI2_REDIST="$HOME/dev/openni2-redist"
 PY="$APPDIR/venv/bin/python"
 APP="$APPDIR/Camera_Simples.py"
 LOG="/tmp/camera-simples.log"
@@ -47,6 +51,9 @@ for f in "$HOME/.Xauthority" "/run/user/$(id -u)/gdm/Xauthority"; do
     [ -f "$f" ] && { export XAUTHORITY="$f"; break; }
 done
 export DISPLAY="$DISP"
+export TZ="${TZ:-America/Sao_Paulo}"   # horario de Brasilia (o fuso do sistema esta em UTC)
+# PC: voz do robo na saida auxiliar P2 (sink analogico); LSA_SINK sobrescreve
+[ "$PERFIL" = pc ] && export LSA_SINK="${LSA_SINK-alsa_output.pci-0000_00_1f.3.analog-stereo}"
 
 achar_dispositivo_usb() {
     local d vendor product bus dev
@@ -177,16 +184,16 @@ iniciar() {
         return 0
     fi
     cd "$APPDIR" || exit 1
-    esperar_usb || exit 1
+    [ "$PERFIL" = jetson ] && { esperar_usb || exit 1; }
     local tentativa
     for tentativa in 1 2 3; do
         # depois de uma falha o sensor passou por reset: espera ele reaparecer
-        [ "$tentativa" -gt 1 ] && { esperar_usb 30 || exit 1; }
+        [ "$tentativa" -gt 1 ] && [ "$PERFIL" = jetson ] && { esperar_usb 30 || exit 1; }
         # O PulseAudio (autostart no login) fica sondando a interface de audio
         # da PrimeSense e trava (usb_set_interface -110 no dmesg), o que deixa
         # o OpenNI2 pendurado ao abrir o video. Ele renasce sozinho quando o
         # mic pedir (pactl) — so precisa estar fora do caminho na abertura.
-        pkill -9 pulseaudio 2>/dev/null
+        [ "$PERFIL" = jetson ] && pkill -9 pulseaudio 2>/dev/null
         nohup "$PY" -u "$APP" "$@" >"$LOG" 2>&1 &
         disown
         if esperar_sensor "$tentativa"; then
@@ -210,6 +217,7 @@ case "${1:-}" in
         status
         ;;
     usb)
+        [ "$PERFIL" = jetson ] || { echo "perfil pc: sem PrimeSense no USB pra esperar."; exit 0; }
         esperar_usb "${2:-}"
         ;;
     start)

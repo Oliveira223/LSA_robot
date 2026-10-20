@@ -1,0 +1,13 @@
+[Unit]
+Description=Cerebro + voz do robo (servidor_conversa: Ollama + Piper) na porta 5005
+After=ollama.service
+Wants=ollama.service
+
+[Service]
+WorkingDirectory=%h/Bitnet_TTS
+ExecStart=%h/dev/LSA_robot/experiments/camera_prime_sense/venv/bin/python -u servidor_conversa.py --host 127.0.0.1
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -9,7 +9,10 @@ import time
 
 import cv2
 import numpy as np
-from primesense import _openni2 as c_api
+try:
+    from primesense import _openni2 as c_api
+except ImportError:          # PC sem PrimeSense: so a webcam (ver WebcamCor)
+    c_api = None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -33,10 +36,27 @@ def localizar_modelo_rosto():
 
 
 # ─── OpenNI2 ──────────────────────────────────────────────────────────
+def _precarregar_libs_openni2_pc():
+    """No PC sem root o OpenNI2 vem de um .deb extraido em ~/dev/openni2-x86; o
+    libjpeg.so.8 que ele pede fica la tambem, fora do caminho do linker."""
+    import ctypes
+    base = os.path.expanduser("~/dev/openni2-x86/usr/lib/x86_64-linux-gnu")
+    for nome in glob.glob(os.path.join(base, "libjpeg.so.8*")):
+        try:
+            ctypes.CDLL(nome, mode=ctypes.RTLD_GLOBAL)
+        except OSError:
+            pass
+        break
+
+
+_precarregar_libs_openni2_pc()
+
+
 def localizar_openni2_redist():
     candidatos = [
         os.environ.get("OPENNI2_REDIST", ""),
-        os.path.expanduser("~/dev/openni2-redist"),  # extraido do .deb, sem sudo
+        os.path.expanduser("~/dev/openni2-x86/usr/lib/x86_64-linux-gnu"),  # .deb extraido, sem sudo (PC)
+        os.path.expanduser("~/dev/openni2-redist"),  # extraido do .deb, sem sudo (Jetson)
         "/usr/lib/aarch64-linux-gnu",
         "/usr/lib/x86_64-linux-gnu",
         "/usr/lib",
@@ -106,7 +126,95 @@ def configurar_depth(stream, res="640x480"):
     return r
 
 
+# ─── Webcam (PC sem PrimeSense) ───────────────────────────────────────
+class WebcamCor:
+    """Faz a webcam V4L2 (cv2.VideoCapture) passar por stream de cor: devolve
+    quadros BGR com ler(). Sem profundidade, entao nao ha distancia dos rostos."""
+
+    def __init__(self, indice=0, res="auto"):
+        self._cap = cv2.VideoCapture(int(indice), cv2.CAP_V4L2)
+        if not self._cap.isOpened():
+            raise RuntimeError("nao consegui abrir a webcam %s" % indice)
+        self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))  # 30 fps no USB 2.0
+        largura, altura = _parse_res(res) if res != "auto" else (1280, 720)
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, largura)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, altura)
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print("Cor: %dx%d@%dfps (webcam %s)" % (w, h, int(self._cap.get(cv2.CAP_PROP_FPS)), indice))
+
+    def ler(self):
+        ok, quadro = self._cap.read()
+        if not ok:
+            raise RuntimeError("a webcam parou de entregar quadros")
+        return quadro
+
+    def stop(self):
+        self._cap.release()
+
+
+def achar_webcam():
+    """Indice da primeira webcam V4L2 que entrega imagem (o /dev/video1 de uma
+    webcam costuma ser so de metadados), ou None."""
+    for i in range(6):
+        if not os.path.exists("/dev/video%d" % i):
+            continue
+        cap = cv2.VideoCapture(i, cv2.CAP_V4L2)
+        ok = cap.isOpened() and cap.read()[0]
+        cap.release()
+        if ok:
+            return i
+    return None
+
+
 # ─── Deteccao de rosto (YOLO, processo separado) ──────────────────────
+# Confirmacao por um 2o detector (YuNet): o YOLO de 128 px confunde mao levantada e
+# celular com rosto. O YuNet olha a ESTRUTURA do rosto (olhos/nariz/boca) e rejeita
+# isso. Um candidato do YOLO so vira alvo se o YuNet confirmar no recorte, ou se o
+# proprio YOLO tiver confianca muito alta. Sem o modelo YuNet, nao confirma nada
+# (comportamento antigo). LSA_ROSTO_CONFIRMAR=0 desliga.
+YUNET_ONNX = os.path.join(BASE_DIR, "model-weights", "face_detection_yunet_2023mar.onnx")
+IOU_YUNET_MIN = float(os.environ.get("LSA_YUNET_IOU", "0.25"))   # casamento minimo YuNet x YOLO
+
+
+def confirmacao_ativa():
+    return os.environ.get("LSA_ROSTO_CONFIRMAR", "1") != "0" and os.path.isfile(YUNET_ONNX) \
+        and hasattr(cv2, "FaceDetectorYN")
+
+
+def _yunet_confirma(yunet, frame, caixa, conf_min):
+    """Caixa (x, y, w, h) do rosto que o YuNet acha DENTRO de `caixa` (do YOLO), em
+    coordenadas do quadro cheio; None se nao houver. So vale se a caixa do YuNet casa
+    com a do YOLO (IoU) — um rosto vizinho a uma mao/celular nao salva a caixa que
+    esta em cima do celular. A caixa devolvida e a do YuNet, que fica em cima do rosto
+    de verdade (e assim se funde com o alvo existente em vez de virar um novo)."""
+    H, W = frame.shape[:2]
+    x, y, w, h = caixa
+    mx, my = int(w * 0.35), int(h * 0.35)               # contexto em volta (testa, queixo, orelhas)
+    x0, y0 = max(0, x - mx), max(0, y - my)
+    x1, y1 = min(W, x + w + mx), min(H, y + h + my)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return None
+    recorte = frame[y0:y1, x0:x1]
+    escala = max(1.0, 160.0 / max(recorte.shape[:2]))   # rosto pequeno: amplia o recorte
+    if escala > 1.0:
+        recorte = cv2.resize(recorte, None, fx=escala, fy=escala, interpolation=cv2.INTER_CUBIC)
+    yunet.setInputSize((recorte.shape[1], recorte.shape[0]))
+    yunet.setScoreThreshold(conf_min)
+    _, rostos = yunet.detect(recorte)
+    if rostos is None:
+        return None
+    melhor, iou_melhor = None, IOU_YUNET_MIN
+    for r in rostos:
+        fx, fy = x0 + r[0] / escala, y0 + r[1] / escala
+        fw, fh = r[2] / escala, r[3] / escala
+        iou = _iou((fx, fy, fw, fh), (x, y, w, h))
+        if iou > iou_melhor:
+            melhor, iou_melhor = (int(fx), int(fy), int(fw), int(fh)), iou
+    return melhor
+
+
 def _processo_detector(cfg, weights, tamanho, confianca, nms, fila_frame, fila_boxes):
     # `confianca` aqui e' o piso: o DetectorRosto decide quem vira trilha nova
     """Carrega a rede uma vez e processa sempre o frame mais recente.
@@ -114,19 +222,53 @@ def _processo_detector(cfg, weights, tamanho, confianca, nms, fila_frame, fila_b
     quando dividido so por thread. Limita a 3 threads pra sobrar um nucleo pro
     video/GUI (a Jetson tem 4 nucleos)."""
     os.nice(10)  # o video/HUD tem prioridade; o rastreio cobre o intervalo entre deteccoes
-    cv2.setNumThreads(3)
+    # 1 thread: a ~10 deteccoes/s uma inferencia (~60 ms) cabe no intervalo, e cada
+    # thread a mais so soma CPU gasta esperando (medido no PC: 3 threads = ~2x a CPU).
+    # Na Jetson (so 4 nucleos, sem limite de taxa) use LSA_YOLO_THREADS=3.
+    try:
+        cv2.setNumThreads(int(os.environ.get("LSA_YOLO_THREADS", "1")))
+    except ValueError:
+        cv2.setNumThreads(1)
     net = cv2.dnn.readNetFromDarknet(cfg, weights)
     net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
     net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
     nomes = net.getLayerNames()
     saidas_net = [nomes[int(i) - 1] for i in net.getUnconnectedOutLayers().flatten()]
 
+    yunet = None
+    conf_alta = float(os.environ.get("LSA_ROSTO_CONF_ALTA", "0.97"))   # acima disso nao precisa de 2a opiniao
+    conf_yunet = float(os.environ.get("LSA_YUNET_CONF", "0.30"))
+    if confirmacao_ativa():
+        try:
+            yunet = cv2.FaceDetectorYN.create(YUNET_ONNX, "", (160, 160), conf_yunet, 0.3, 50)
+        except Exception as e:
+            print("[rosto] YuNet nao carregou (%s); sem confirmacao" % e, flush=True)
+    t_log = 0.0
+
+    # Sem limite o loop roda 1 inferencia atras da outra (~30/s, ~3 nucleos
+    # ocupados o tempo todo no PC). O fluxo optico do DetectorRosto ja move as
+    # caixas a cada quadro, entao ~10 deteccoes/s bastam: mesma qualidade de
+    # rastreio com ~1/4 da CPU. LSA_YOLO_HZ muda (0 = sem limite).
+    try:
+        hz = float(os.environ.get("LSA_YOLO_HZ", "10"))
+    except ValueError:
+        hz = 10.0
+    intervalo = 1.0 / hz if hz > 0 else 0.0
+    t_ult = 0.0
+
     while True:
+        espera = intervalo - (time.time() - t_ult)
+        if espera > 0:
+            time.sleep(espera)   # dorme ANTES do get(): pega o quadro mais recente
         item = fila_frame.get()
         if item is None:
             break
+        t_ult = time.time()
         fid, frame, (largura, altura) = item  # frame ja vem reduzido pra tamanho x tamanho
 
+        cheio = frame
+        if frame.shape[0] != tamanho or frame.shape[1] != tamanho:     # quadro cheio: reduz aqui
+            frame = cv2.resize(frame, (tamanho, tamanho), interpolation=cv2.INTER_AREA)
         blob = cv2.dnn.blobFromImage(frame, 1 / 255.0, (tamanho, tamanho), swapRB=True, crop=False)
         net.setInput(blob)
         saidas = net.forward(saidas_net)
@@ -145,6 +287,19 @@ def _processo_detector(cfg, weights, tamanho, confianca, nms, fila_frame, fila_b
             indices = cv2.dnn.NMSBoxes(caixas, confs, confianca, nms)
             if len(indices):
                 resultado = [tuple(caixas[i]) + (confs[i],) for i in np.array(indices).flatten()]
+                if yunet is not None:
+                    aceitos = []
+                    for c in resultado:
+                        if c[4] >= conf_alta:
+                            aceitos.append(c)
+                            continue
+                        fx = _yunet_confirma(yunet, cheio, c[:4], conf_yunet)
+                        if fx is not None:
+                            aceitos.append(fx + (c[4],))        # caixa do YuNet, confianca do YOLO
+                        elif c[4] >= 0.5 and time.time() - t_log > 2.0:   # so as fortes (as fracas nunca virariam alvo); sem inundar o log
+                            t_log = time.time()
+                            print("[rosto] candidato descartado (conf %.2f): o YuNet nao viu rosto" % c[4], flush=True)
+                    resultado = aceitos
 
         try:
             while True:
@@ -198,6 +353,11 @@ def _contida(a, b):
     return (ix * iy) / menor if menor > 0 else 0.0
 
 
+# Anti-"muitas caixas": confirmacoes seguidas pra um candidato virar alvo, e teto de alvos.
+CONFIRMACOES = int(os.environ.get("LSA_ROSTO_CONFIRMACOES", "2"))
+MAX_TRILHAS = int(os.environ.get("LSA_ROSTO_MAX_ALVOS", "4"))
+
+
 def _mesmo_rosto(a, b):
     return _iou(a, b) > 0.15 or _contida(a, b) > 0.6
 
@@ -235,6 +395,12 @@ class DetectorRosto:
         self._fila_frame = ctx.Queue(maxsize=1)
         self._fila_boxes = ctx.Queue(maxsize=1)
         self._trt = engine is not None
+        self._confirmar = (not self._trt) and confirmacao_ativa()
+        if self._confirmar:
+            # com o YuNet confirmando, um rosto de verdade e reconfirmado varias vezes por
+            # segundo; uma caixa que ficou 8 s sem confirmacao e quase sempre o fluxo optico
+            # carregando um celular/mao. 2.5 s cobre perfil/olhar pra baixo sem prender a caixa.
+            self.validade = min(self.validade, 2.5)
         if self._trt:
             # com TensorRT (~50 ms) ha confirmacao ~15x/s: nao precisa segurar a
             # trilha tanto tempo sem confirmar (some logo quando a pessoa sai)
@@ -290,6 +456,8 @@ class DetectorRosto:
         # manda ~50 KB pela fila em vez de ~900 KB por quadro
         if self._trt:
             envio = frame_bgr  # quadro cheio: os rostos pequenos mantem a resolucao
+        elif self._confirmar:
+            envio = frame_bgr  # o processo precisa do quadro cheio pra recortar e confirmar
         else:
             envio = cv2.resize(frame_bgr, (self.tamanho, self.tamanho), interpolation=cv2.INTER_AREA)
 
@@ -328,8 +496,13 @@ class DetectorRosto:
                 mv = self._mover(self._gray_prev, gray, t["pts"])
                 if mv:
                     dx, dy, t["pts"] = mv
-                    t["box"][0] += dx / self._escala
-                    t["box"][1] += dy / self._escala
+                    # um rosto nao anda mais que ~1/3 do proprio tamanho num quadro; um salto
+                    # maior e a mao (ou outro objeto) arrastando os pontos: ignora o movimento
+                    if max(abs(dx), abs(dy)) > 0.33 * max(t["box"][2], t["box"][3]):
+                        t["pts"] = None
+                    else:
+                        t["box"][0] += dx / self._escala
+                        t["box"][1] += dy / self._escala
                 if t["pts"] is None or len(t["pts"]) < 6:
                     t["pts"] = self._semear(gray, t["box"])
                 # sem pontos pra seguir, a caixa nao anda mais: nao vale segurar por
@@ -345,21 +518,57 @@ class DetectorRosto:
                 motivo = "sem confirmacao"
             elif t["cega"] >= 15:                                # ~0.5 s sem nada pra seguir
                 motivo = "sem pontos"
+            elif t["n"] < CONFIRMACOES and agora - t["nasc"] > 0.8:
+                motivo = "nao confirmou"                         # candidato que nao se repetiu
             elif not self._dentro(t["box"], W, H):
                 motivo = "saiu da imagem"
             else:
                 mantidas.append(t)
                 continue
             if os.environ.get("FACE_DEBUG"):
-                print("trilha %d morreu (%s) idade %.1fs" % (t["id"], motivo, agora - t["nasc"]), flush=True)
-        self._trilhas = mantidas
+                print("trilha %s morreu (%s) idade %.1fs" % (t["id"], motivo, agora - t["nasc"]), flush=True)
+        self._trilhas = self._sem_duplicatas(mantidas)
         self._gray_prev = gray
+
+    @staticmethod
+    def _sem_duplicatas(trilhas):
+        """Duas trilhas no mesmo rosto (a antiga arrastada pela mao + a nova): fica a
+        mais velha confirmada; a outra sai. Teto separado: ate MAX_TRILHAS alvos
+        confirmados e 2 candidatos (os mais novos), pra uma mao varrendo a frente da
+        camera nao encher a lista nem bloquear um rosto de verdade."""
+        trilhas = sorted(trilhas, key=lambda t: (t["n"] < CONFIRMACOES, t["nasc"]))
+        fica = []
+        for t in trilhas:
+            if all(_iou(t["box"], o["box"]) < 0.25 and _contida(t["box"], o["box"]) < 0.5 for o in fica):
+                fica.append(t)
+        confirmadas = [t for t in fica if t["n"] >= CONFIRMACOES][:MAX_TRILHAS]
+        candidatas = sorted((t for t in fica if t["n"] < CONFIRMACOES),
+                            key=lambda t: t["nasc"], reverse=True)[:2]
+        return confirmadas + candidatas
 
     @staticmethod
     def _dentro(box, W, H):
         """Falso quando o centro da caixa saiu da imagem (pessoa saiu de cena)."""
         cx, cy = box[0] + box[2] / 2, box[1] + box[3] / 2
         return 0 <= cx < W and 0 <= cy < H
+
+    def _colado_em_alvo(self, box):
+        """Trilha confirmada a menos de 1 tamanho de rosto do centro de `box` (ou None): uma
+        deteccao ali so pode ser o celular/mao ao lado do rosto, nao outra pessoa."""
+        cx, cy = box[0] + box[2] / 2, box[1] + box[3] / 2
+        for t in self._trilhas:
+            if t["n"] < CONFIRMACOES:
+                continue
+            tx, ty = t["box"][0] + t["box"][2] / 2, t["box"][1] + t["box"][3] / 2
+            if ((cx - tx) ** 2 + (cy - ty) ** 2) ** 0.5 < max(t["box"][2], t["box"][3]):
+                return t
+        return None
+
+    def descartar(self, tid):
+        """Remove o alvo `tid` (ex.: a profundidade mudou de repente: ha um objeto na frente)."""
+        antes = len(self._trilhas)
+        self._trilhas = [t for t in self._trilhas if t["id"] != tid]
+        return len(self._trilhas) != antes
 
     def _incorporar(self, res, gray_agora, agora):
         fid, caixas = res
@@ -375,7 +584,10 @@ class DetectorRosto:
                     box[1] += mv[1]
             par = max(self._trilhas, key=lambda t: max(_iou(t["box"], box), _contida(t["box"], box)),
                       default=None)
-            if par is not None and _mesmo_rosto(par["box"], box):
+            # candidato ainda nao confirmado so conta como "visto de novo" se a caixa ficou
+            # praticamente no mesmo lugar (IoU alto); alvo ja confirmado e mais tolerante
+            if par is not None and _mesmo_rosto(par["box"], box) and (
+                    par["n"] >= CONFIRMACOES or _iou(par["box"], box) > 0.4):
                 # trilha existente: aceita ate confianca baixa (rosto de perfil,
                 # borrado, mao na frente...) — so nao deixa a trilha morrer
                 m = self.mescla
@@ -383,19 +595,38 @@ class DetectorRosto:
                 par["visto"] = agora
                 par["pts"] = self._semear(gray_agora, par["box"])
                 par["cega"] = 0
+                par["n"] += 1
+                if par["id"] is None and par["n"] >= CONFIRMACOES:
+                    par["id"] = self._prox_id
+                    self._prox_id += 1
             elif conf >= self.confianca:
+                colado = self._colado_em_alvo(box)
+                if colado is not None:
+                    # deteccao (ja confirmada pelo YuNet) colada num alvo que nao e
+                    # reconfirmado ha um tempo: a caixa foi arrastada por um objeto;
+                    # puxa de volta pro rosto. Se foi confirmado agora, e o celular: ignora.
+                    if agora - colado["visto"] > 0.6:
+                        colado["box"] = box
+                        colado["visto"] = agora
+                        colado["pts"] = self._semear(gray_agora, box)
+                        colado["cega"] = 0
+                    continue
                 if os.environ.get("FACE_DEBUG"):
                     print("trilha %d nasceu conf %.2f box %s" % (self._prox_id, conf, [int(v) for v in box]), flush=True)
-                self._trilhas.append({"id": self._prox_id, "box": box, "visto": agora,
-                                      "nasc": agora, "cega": 0,
-                                      "pts": self._semear(gray_agora, box)})
-                self._prox_id += 1
+                # candidato: so ganha id (e aparece em alvos()) depois de CONFIRMACOES
+                # deteccoes seguidas no mesmo lugar (sem atalho por confianca alta)
+                novo = {"id": None, "box": box, "visto": agora, "nasc": agora, "cega": 0, "n": 1,
+                        "pts": self._semear(gray_agora, box)}
+                if CONFIRMACOES <= 1:
+                    novo["id"] = self._prox_id
+                    self._prox_id += 1
+                self._trilhas.append(novo)
 
     def alvos(self):
         """[(id, (x, y, w, h), idade_s)] no tamanho do frame da camera."""
         agora = time.time()
         return [(t["id"], tuple(int(v) for v in t["box"]), agora - t["nasc"])
-                for t in self._trilhas]
+                for t in self._trilhas if t["id"] is not None]
 
     def boxes(self):
         return [b for (_i, b, _a) in self.alvos()]
@@ -486,6 +717,20 @@ def _texto(img, txt, pos, escala, cor):
 def _texto_grande(img, txt, pos, escala, cor):
     cv2.putText(img, txt, pos, cv2.FONT_HERSHEY_DUPLEX, escala, (0, 0, 0), 4, cv2.LINE_AA)
     cv2.putText(img, txt, pos, cv2.FONT_HERSHEY_DUPLEX, escala, cor, 2, cv2.LINE_AA)
+
+
+def profundidade_mediana_mm(depth, caixa):
+    """Mediana (mm) da profundidade no miolo (40%) de `caixa` (x, y, w, h, coords do mapa
+    de profundidade); None se nao ha pixels validos. Sem suavizacao: serve pra pegar
+    mudancas bruscas (objeto passando na frente)."""
+    H, W = depth.shape[:2]
+    x, y, w, h = caixa
+    cx, cy = x + w / 2, y + h / 2
+    x0, x1 = int(max(0, cx - w * 0.2)), int(min(W, cx + w * 0.2))
+    y0, y1 = int(max(0, cy - h * 0.2)), int(min(H, cy + h * 0.2))
+    v = depth[y0:y1, x0:x1].ravel()
+    v = v[(v >= 350) & (v <= 6000)]
+    return float(np.median(v)) if v.size >= 10 else None
 
 
 class MedidorDistancia:

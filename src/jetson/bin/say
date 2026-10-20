@@ -24,7 +24,9 @@ ESPEAK_DATA="$PIPER_DIR/espeak-ng-data"
 LOG="/tmp/piper.log"
 RATE_HZ=22050
 # sink de saida: fixo no HDMI (onde esta a caixa). Sobrescreva com SAY_SINK=...
-SINK="${SAY_SINK:-alsa_output.platform-3510000.hda.hdmi-stereo-extra1}"
+if [ "$(uname -m)" = aarch64 ]; then SINK_PADRAO=alsa_output.platform-3510000.hda.hdmi-stereo-extra1
+else SINK_PADRAO=alsa_output.pci-0000_00_1f.3.analog-stereo; fi   # PC: saida auxiliar P2
+SINK="${SAY_SINK:-$SINK_PADRAO}"
 # lead-in: ruido bem baixo (inaudivel) colado ANTES de cada fala, no mesmo
 # stream, pra o monitor HDMI acordar o amp antes da 1a silaba.
 LEAD_MS="${SAY_LEAD_MS:-50}"       # duracao do lead-in (50ms = suficiente aqui)

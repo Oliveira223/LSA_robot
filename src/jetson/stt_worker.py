@@ -42,7 +42,28 @@ import sys
 TAXA = 16000
 GRAMATICA_PADRAO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gramatica.json")
 # a sigla falada sai soletrada; o repertorio da Jetson 1 espera "lsa"
-_SIGLAS = [(re.compile(r"\b[eé]le [eé]sse [aá]\b"), "lsa")]
+# (manter em sincronia com TROCAS em gerar_gramatica.py)
+_VOGAIS = {"a": "[aàáâã]", "e": "[eéê]", "i": "[ií]", "o": "[oóô]", "u": "[uú]"}
+
+
+def _falado(frase):
+    """Regex que aceita as variantes com/sem acento de uma frase falada."""
+    return re.compile(r"\b" + "".join(_VOGAIS.get(c, c) for c in frase) + r"\b")  # "ê" literal fica so ê
+
+
+_SIGLAS = [(_falado(f), w) for f, w in [
+    ("ele esse a", "lsa"),
+    ("pe u ce erre esse", "pucrs"),
+    ("je pe te", "gpt"),
+    ("je pe esse", "gps"),
+    ("tres dê", "3d"),
+    ("cinco je", "5g"),
+    ("i o te", "iot"),
+    ("erre o esse", "ros"),
+    ("ce te je", "ctg"),
+    ("uai fi", "wifi"),
+    ("erre esse", "rs"),
+]]
 
 
 class _Gramatica:

@@ -32,12 +32,28 @@ import unicodedata
 
 MODELO = os.path.expanduser("~/dev/vosk-model-small-pt-0.3")
 SAIDA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gramatica.json")
-TROCAS = {"lsa": "éle ésse á"}
+# Palavras que o Vosk nao tem (siglas, estrangeirismos) viram o jeito de falar com
+# palavras que ele tem; o stt_worker.py (_SIGLAS) faz a troca de volta. Manter os
+# dois em sincronia. "gê" nao existe no vocabulario, entao o G vira "jé".
+TROCAS = {
+    "lsa": "éle ésse á",
+    "pucrs": "pê u cê erre esse",
+    "rs": "erre esse",
+    "gpt": "jé pê tê",
+    "chatgpt": "chat jé pê tê",
+    "gps": "jé pê esse",
+    "3d": "três dê",
+    "5g": "cinco jé",
+    "iot": "i ó tê",
+    "ros": "erre ó esse",
+    "ctg": "cê tê jé",
+    "wifi": "uai fi",
+}
 # palavras curtas/comuns com forma certa conhecida (sem isso as combinacoes de
 # acento explodem e frases como "qual é o seu nome" ficavam de fora)
 FORMAS = {"e": ["é", "e"], "a": ["a"], "o": ["o"], "os": ["os"], "as": ["as"], "voce": ["você"],
           "esta": ["está"], "ta": ["tá"], "robo": ["robô"], "nao": ["não"], "sao": ["são"],
-          "ola": ["olá"], "tambem": ["também"], "ja": ["já"], "so": ["só"], "ai": ["aí"]}
+          "dê": ["dê"], "ola": ["olá"], "tambem": ["também"], "ja": ["já"], "so": ["só"], "ai": ["aí"]}
 MAX_VARIANTES = 24    # combinacoes de acentos por gatilho
 
 

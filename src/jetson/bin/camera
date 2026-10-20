@@ -396,6 +396,73 @@ class Terminal(cmd.Cmd):
     def complete_faces(self, texto, linha, inicio, fim):
         return [o for o in ("on", "off") if o.startswith(texto)]
 
+    def do_body(self, arg):
+        """body [on|off|M] - liga/desliga a DETECCAO DE CORPO (esqueleto, MediaPipe) sem reiniciar o app.
+
+          body         mostra se esta ligada e ate que distancia
+          body off     encerra o processo do MediaPipe (libera CPU e memoria): some o esqueleto
+          body on      volta a detectar (leva alguns segundos pra carregar o modelo)
+          body 2       so detecta quem esta a ate 2 m (padrao 2,5 m; 0 = sem limite)
+
+        A distancia vem da profundidade da PrimeSense no meio dos ombros; quem esta mais longe nao
+        ganha esqueleto nem conta como alguem na frente. Sem leitura de profundidade o corpo fica.
+
+        Nao mexe na deteccao de rosto (use `faces`), nem nas duas juntas (use `vision`).
+        Abrir ja desligada: start --no-corpo; com outro limite: start --corpo-dist 3.
+        Vale so enquanto o app roda."""
+        return self._remoto("body", arg)
+
+    def complete_body(self, texto, linha, inicio, fim):
+        return [o for o in ("on", "off") if o.startswith(texto)]
+
+    def do_presence(self, arg):
+        """presence [on|off|M] - o robo so responde a fala quando ha alguem na frente dele.
+
+          presence        mostra o estado (e se ha alguem na frente agora)
+          presence off    responde a qualquer fala, mesmo sem ninguem (inclusive conversa de fundo)
+          presence on     volta a exigir alguem na frente
+          presence 3      alem de ligar, muda a distancia maxima pra 3 m (padrao 2,3 m)
+
+        "Alguem" = um rosto confirmado ou um corpo (MediaPipe) dentro da distancia, medida pela
+        profundidade da PrimeSense; vale ate 4 s depois do ultimo quadro com alguem. Sem rosto nem
+        corpo ligados (`vision off`) nao ha o que checar e a fala passa sempre. A fala ignorada nem
+        e transcrita (nao gasta CPU) e aparece no log como "descartado (ninguem na frente)". O robo
+        tambem NAO FALA sem ninguem na frente: o audio das respostas (inclusive de `type`) e
+        descartado; `say` e a saudacao nao sao barrados. Abrir sem a checagem: start --no-presenca."""
+        return self._remoto("presence", arg)
+
+    def complete_presence(self, texto, linha, inicio, fim):
+        return [o for o in ("on", "off") if o.startswith(texto)]
+
+    def do_mic(self, arg):
+        """mic [xtion|embutido|auto] - escolhe o microfone do robo.
+
+          mic             mostra qual esta em uso e o estado
+          mic auto        (padrao) usa o do Xtion e, se o audio USB dele travar, passa SOZINHO pro
+                          microfone embutido do PC (o travamento exigia replug do cabo)
+          mic embutido    fica no microfone do PC (ganho de captura ajustado pra nao saturar)
+          mic xtion       volta pro do Xtion (so funciona se o audio USB dele nao estiver travado)
+
+        Abrir ja num deles: start --mic embutido. Vale so enquanto o app roda."""
+        return self._remoto("mic", arg)
+
+    def complete_mic(self, texto, linha, inicio, fim):
+        return [o for o in ("xtion", "embutido", "auto") if o.startswith(texto)]
+
+    def do_vision(self, arg):
+        """vision [on|off] - liga/desliga a VISAO inteira: rosto (YOLO) e corpo (MediaPipe) juntos.
+
+          vision       mostra o estado das duas
+          vision off   encerra os dois detectores: o robo para de marcar rostos e de desenhar o
+                       esqueleto (e deixa de saudar quem chega), liberando a maior parte da CPU
+          vision on    liga as duas de novo (leva alguns segundos pra carregar os modelos)
+
+        Pra mexer em uma so: `faces` (rosto) ou `body` (corpo). Vale so enquanto o app roda."""
+        return self._remoto("vision", arg)
+
+    def complete_vision(self, texto, linha, inicio, fim):
+        return [o for o in ("on", "off") if o.startswith(texto)]
+
     def do_listen(self, arg):
         """listen - mostra no terminal, ao vivo, o que o microfone entende (e as respostas do robo).
 
@@ -551,6 +618,10 @@ Conversar com o robo
 Ver e ajustar (sem reiniciar nada)
   status              estado de camera, profundidade, rostos, microfone, cerebro e voz
   faces [on|off]      liga/desliga a deteccao de rosto (desligada nao pesa na GPU/CPU)
+  body [on|off|M]     liga/desliga a deteccao de corpo (esqueleto do MediaPipe), so ate M metros (padrao 2,5)
+  vision [on|off]     liga/desliga rosto e corpo de uma vez
+  presence [on|off|M] so responde a fala com alguem na frente (ate M metros)
+  mic [xtion|embutido|auto]  escolhe o microfone (auto: se o Xtion travar, usa o embutido)
   greet [...]         liga/desliga e ajusta o "bom dia" quando um rosto chega perto
 
 O app da camera
