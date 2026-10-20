@@ -28,6 +28,7 @@ propria voz do robo. `falar(texto)` serve tambem pro comando `falar` do terminal
 Compatibilidade: Python 3.6 da Jetson.
 """
 import os
+import platform
 import subprocess
 import threading
 import time
@@ -36,7 +37,8 @@ SAY_BIN = os.path.expanduser("~/dev/LSA_robot/src/jetson/bin/say")
 PIPER_BIN = os.path.expanduser("~/piper/piper")
 WAV_PADRAO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio", "bom_dia.wav")
 TEXTO_PADRAO = "Bom dia"
-SINK = "alsa_output.platform-3510000.hda.hdmi-stereo-extra1"   # caixa HDMI (igual ao conversa_client)
+# caixa HDMI na Jetson; no PC, "" = sink padrao (saida auxiliar P2). LSA_SINK sobrescreve (igual ao conversa_client)
+SINK = os.environ.get("LSA_SINK", "" if platform.machine() != "aarch64" else "alsa_output.platform-3510000.hda.hdmi-stereo-extra1")
 CAUDA_S = 0.7
 
 
@@ -92,11 +94,11 @@ class Saudador:
 
     def _comando(self, texto):
         """(nome, argv, env) do motor de voz disponivel."""
-        env = dict(os.environ, PULSE_SINK=SINK)
+        env = dict(os.environ, PULSE_SINK=SINK) if SINK else dict(os.environ)
         if os.path.exists(PIPER_BIN) and os.path.exists(SAY_BIN):
             return "say/piper", [SAY_BIN, "-1", texto], env
         if texto == TEXTO_PADRAO and self.wav and os.path.exists(self.wav):
-            return "wav", ["paplay", "--device=" + SINK, self.wav], env
+            return "wav", ["paplay"] + (["--device=" + SINK] if SINK else []) + [self.wav], env
         return "spd-say", ["spd-say", "-w", "-l", "pt-BR", texto], env
 
     def falar(self, texto):

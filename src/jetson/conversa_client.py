@@ -30,6 +30,7 @@ Uso (a partir de src/, teste isolado; digite e a resposta e falada):
 
 import io
 import os
+import platform
 import queue
 import random
 import socket
@@ -40,6 +41,7 @@ import threading
 import time
 import wave
 
+from jetson.cerebro_claude import SessaoClaude
 from common.protocol import AUDIO, TEXTO, recv_msg, send_texto
 
 CTRL = "\x00"                          # TEXTO de controle do servidor (ver servidor_conversa.py)
@@ -55,11 +57,15 @@ KEEPALIVE_CHECK_S = 20                   # de quanto em quanto tempo confere se 
 LEAD_MS = 50
 LEAD_AMP = 30                            # ~ -60 dBFS: inaudivel, mas acorda o amplificador
 
-HOST_PADRAO = "10.10.10.1"
+# No PC (tudo numa maquina so) o cerebro roda aqui mesmo, o audio sai no alto-falante
+# padrao e nao ha HDMI que durma; na Jetson 2 o cerebro esta na Jetson 1, pelo cabo.
+# LSA_CEREBRO_HOST / LSA_SINK sobrescrevem; LSA_SINK="" = sink padrao.
+NO_PC = platform.machine() != "aarch64"
+HOST_PADRAO = os.environ.get("LSA_CEREBRO_HOST") or ("127.0.0.1" if NO_PC else "10.10.10.1")
 PORTA_PADRAO = 5005
 
 # saida do alto-falante do robo (HDMI da Jetson 2, mesmo sink do jetson/bin/say)
-SINK_PADRAO = "alsa_output.platform-3510000.hda.hdmi-stereo-extra1"
+SINK_PADRAO = os.environ.get("LSA_SINK", "" if NO_PC else "alsa_output.platform-3510000.hda.hdmi-stereo-extra1")
 
 RECONEXAO_BACKOFF_S = 2.0
 RECONEXAO_BACKOFF_MAX_S = 10.0
@@ -120,6 +126,8 @@ class ClienteConversa:
         self._sock = None
         self._conectado = False
         self._rodando = True
+        self._presenca = None                # funcao() -> bool: ha alguem na frente? (None = fala sempre)
+        self._forcar_fala = False            # True durante falar_literal: fala de teste/saudacao nao e barrada
         self._tocando = 0                    # frases na fila de reproducao ou tocando
         self._mudo_ate = 0.0
         self._suporta_falar = False          # servidor novo anuncia no hello
@@ -130,10 +138,15 @@ class ClienteConversa:
         self._tocador = None                 # paplay em andamento (pra poder interromper)
         self._envio = queue.Queue()
         self._reproducao = queue.Queue()
+        self._cerebro = "ollama"             # ou "claude" (ver definir_cerebro)
+        self._claude = SessaoClaude()
+        self._claude_fila = queue.Queue()
+        self._claude_cancelar = False
         threading.Thread(target=self._vigiar_keepalive, daemon=True).start()
         threading.Thread(target=self._loop_conexao, daemon=True).start()
         threading.Thread(target=self._loop_envio, daemon=True).start()
         threading.Thread(target=self._loop_reproducao, daemon=True).start()
+        threading.Thread(target=self._loop_claude, daemon=True).start()
 
     # ── consulta ───────────────────────────────────────────────────────
     def conectado(self):
@@ -145,8 +158,8 @@ class ClienteConversa:
     def _vigiar_keepalive(self):
         """O PulseAudio cai (launcher, queda) e leva o keepalive junto; sem ele o monitor HDMI
         dorme e corta a 1a silaba. Confere de tempos em tempos e religa."""
-        if not os.path.exists(KEEPALIVE_BIN):
-            return
+        if NO_PC or not os.path.exists(KEEPALIVE_BIN):
+            return                       # so a Jetson tem o HDMI que dorme
         while self._rodando:
             _garantir_keepalive()
             for _ in range(int(KEEPALIVE_CHECK_S)):
@@ -164,6 +177,7 @@ class ClienteConversa:
         resto do audio da resposta em curso (o texto continua chegando). Devolve quantas
         frases foram descartadas."""
         descartadas = 0
+        self._claude_cancelar = True
         with self._lock:
             if self.aguardando():        # so ha o que descartar se a resposta ainda esta chegando
                 self._descartar_ate = time.time() + TIMEOUT_RESPOSTA_S
@@ -187,7 +201,39 @@ class ClienteConversa:
     def suporta_falar(self):
         return self._conectado and self._suporta_falar
 
-    def falar_literal(self, texto, timeout=TIMEOUT_FALAR_S):
+    def cerebro(self):
+        return self._cerebro
+
+    def definir_cerebro(self, modo):
+        """"claude" (re)abre a sessao (relendo o contexto) e a aquece em segundo plano."""
+        if modo not in ("ollama", "claude"):
+            raise ValueError("cerebro desconhecido: %r" % modo)
+        self._cerebro = modo
+        if modo == "claude":
+            threading.Thread(target=self._aquecer_claude, daemon=True).start()
+        else:
+            self._claude.parar()
+
+    def modelo_claude(self, modelo=None):
+        if modelo:
+            self._claude.modelo = modelo
+            if self._cerebro == "claude":
+                self.definir_cerebro("claude")          # reabre com o modelo novo
+        return self._claude.modelo
+
+    def _aquecer_claude(self):
+        try:
+            self._claude.iniciar()
+        except Exception as e:                          # noqa: BLE001
+            print("[conversa] claude nao aqueceu: %s" % e, flush=True)
+
+    def definir_presenca(self, funcao):
+        """funcao() -> True se ha alguem na frente do robo agora. Sem ninguem, o AUDIO das respostas
+        e descartado (o robo nao fala pro vazio, nem se a pessoa sair no meio da resposta). A fala
+        literal (`falar`/`say`/saudacao) nao e barrada. None desliga a checagem."""
+        self._presenca = funcao
+
+    def falar_literal(self, texto, timeout=TIMEOUT_FALAR_S, esperar_tocar=True):
         """Pede a Jetson 1 pra falar `texto` com a voz do robo (Piper), sem passar
         pelo cerebro, e espera terminar de tocar aqui. Devolve (ok, mensagem)."""
         if not self._conectado:
@@ -197,23 +243,55 @@ class ClienteConversa:
                            "(atualize servidor_conversa.py la e reinicie)")
         self._fim.clear()
         self._aguardando_desde = time.time()
-        self._envio.put(PREFIXO_FALAR + texto)
-        if not self._fim.wait(timeout):
-            self._descartar_ate = time.time() + TIMEOUT_RESPOSTA_S   # fala atrasada nao toca por cima
-            return False, "a Jetson 1 nao respondeu em %.0f s" % timeout
-        limite = time.time() + 60.0
-        while self.falando() and time.time() < limite:
-            time.sleep(0.1)
-        return True, "voz do robo (Piper, Jetson 1)"
+        self._forcar_fala = True
+        try:
+            self._envio.put(PREFIXO_FALAR + texto)
+            if not self._fim.wait(timeout):
+                self._descartar_ate = time.time() + TIMEOUT_RESPOSTA_S   # fala atrasada nao toca por cima
+                return False, "a Jetson 1 nao respondeu em %.0f s" % timeout
+            limite = time.time() + 60.0
+            while esperar_tocar and self.falando() and time.time() < limite:
+                time.sleep(0.1)
+            return True, "voz do robo (Piper, Jetson 1)"
+        finally:
+            self._forcar_fala = False
 
     def enviar(self, texto):
         """Enfileira a pergunta. Se nao ha conexao, avisa e descarta (o robo
         nao vai responder uma pergunta de minutos atras quando voltar)."""
+        if self._cerebro == "claude":
+            self._aguardando_desde = time.time()
+            self._claude_cancelar = False
+            self._claude_fila.put(texto)
+            return
         if not self._conectado:
             self._nova_bolha("robo", "Estou sem conexão com o meu cérebro.")
             return
         self._aguardando_desde = time.time()
         self._envio.put(texto)
+
+    def _falar_frase_claude(self, frase):
+        # O servidor da Jetson 1 devolve a frase falada como TEXTO + AUDIO, e esse TEXTO ja
+        # vira a bolha (em _receber): criar outra aqui duplicaria. So sem voz a bolha e daqui.
+        if self._conectado and self._suporta_falar:
+            ok, _ = self.falar_literal(frase, esperar_tocar=False)
+            if ok:
+                return
+        self._nova_bolha("robo", frase)
+
+    def _loop_claude(self):
+        while self._rodando:
+            try:
+                pergunta = self._claude_fila.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            try:
+                self._claude.perguntar(pergunta, self._falar_frase_claude,
+                                       cancelado=lambda: self._claude_cancelar)
+            except Exception as e:                          # noqa: BLE001 - vira fala de erro
+                print("[conversa] claude: %s" % e, flush=True)
+                self._falar_frase_claude("Desculpe, tive um problema para pensar nisso.")
+            self._aguardando_desde = 0.0
 
     def _nova_bolha(self, autor, texto):
         print("[conversa] %s: %s" % (autor, texto), flush=True)
@@ -275,6 +353,10 @@ class ClienteConversa:
                 if self.descartando():
                     print("[conversa] audio descartado (interrompido)", flush=True)
                     continue
+                presenca = self._presenca
+                if presenca is not None and not self._forcar_fala and not presenca():
+                    print("[conversa] fala descartada (ninguem na frente)", flush=True)
+                    continue
                 print("[conversa] audio recebido (%d bytes)" % len(msg.dados), flush=True)
                 with self._lock:
                     self._tocando += 1
@@ -309,7 +391,8 @@ class ClienteConversa:
                     f.write(com_lead_in(wav))
                     caminho = f.name
                 for tentativa in (1, 2):
-                    tocador = subprocess.Popen(["paplay", "-d", self._sink, caminho],
+                    cmd = ["paplay"] + (["-d", self._sink] if self._sink else []) + [caminho]
+                    tocador = subprocess.Popen(cmd,
                                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                     self._tocador = tocador
                     try:
@@ -320,7 +403,7 @@ class ClienteConversa:
                     if tocador.returncode == 0 or tocador.returncode < 0:   # <0: interrompido de proposito
                         break
                     print("[conversa] paplay rc=%d: %s" % (tocador.returncode, erro.decode(errors="replace").strip()), flush=True)
-                    if tentativa == 1:     # PulseAudio pode ter caido: religa e tenta de novo
+                    if tentativa == 1 and not NO_PC:   # PulseAudio pode ter caido: religa e tenta de novo
                         subprocess.run(["pulseaudio", "--start"], timeout=20,
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except (OSError, subprocess.SubprocessError) as e:
@@ -338,6 +421,7 @@ class ClienteConversa:
 
     def parar(self):
         self._rodando = False
+        self._claude.parar()
         with self._lock:
             s = self._sock
         if s is not None:

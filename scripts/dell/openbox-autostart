@@ -1,0 +1,3 @@
+# Abre o robo (camera + YOLO + microfone + conversa com Ollama) ao entrar no desktop.
+# O cerebro (ollama + lsa-cerebro) ja sobe sozinho como servico de usuario.
+(sleep 3 && ~/.local/bin/camera-simples start) &

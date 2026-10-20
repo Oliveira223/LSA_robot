@@ -9,21 +9,35 @@ O painel so e redesenhado (PIL) quando as mensagens ou o estado mudam; nos
 outros quadros so faz o blend do overlay ja pronto em cima do video.
 """
 
+import os
+
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-FONTE = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-FONTE_NEGRITO = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+# primeira que existir: sem uma fonte TrueType o PIL cai na fonte padrao minuscula
+# (e os acentos saem errados), entao ha varias opcoes
+_FONTES = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/opentype/urw-base35/NimbusSans-Regular.otf",
+    "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+]
+_FONTES_NEGRITO = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/opentype/urw-base35/NimbusSans-Bold.otf",
+    "/usr/share/fonts/truetype/noto/NotoSansMono-Bold.ttf",
+]
+FONTE = next((f for f in _FONTES if os.path.exists(f)), _FONTES[0])
+FONTE_NEGRITO = next((f for f in _FONTES_NEGRITO if os.path.exists(f)), _FONTES_NEGRITO[0])
 
 # RGB
 COR_HUD = (0, 220, 255)       # ciano, mesma paleta dos outros paineis
-COR_TEXTO = (240, 248, 255)
-COR_BALAO = (14, 52, 74, 215)
-COR_BALAO_ROBO = (18, 70, 44, 215)
+COR_TEXTO = (255, 255, 255)
+COR_BALAO = (10, 40, 60, 245)
+COR_BALAO_ROBO = (14, 60, 36, 245)
 COR_BORDA_ROBO = (110, 255, 130)
-COR_FUNDO = (0, 0, 0, 120)
-COR_APAGADA = (150, 170, 180)
+COR_FUNDO = (8, 14, 24, 215)
+COR_APAGADA = (190, 205, 215)
 COR_OK = (110, 255, 130)
 COR_ERRO = (255, 90, 80)
 
@@ -58,7 +72,7 @@ def _quebrar(draw, texto, fonte, largura_max):
 
 
 class PainelTranscricao:
-    def __init__(self, margem=20, altura_frac=0.5, largura_frac=0.32, titulo="TRANSCRIÇÃO"):
+    def __init__(self, margem=20, altura_frac=0.42, largura_frac=0.28, titulo="CONVERSA"):
         self.margem, self.altura_frac, self.largura_frac = margem, altura_frac, largura_frac
         self.titulo = titulo
         self._chave = None
@@ -66,39 +80,68 @@ class PainelTranscricao:
         self._inv_alpha = None  # 255 - alpha, 3 canais (uint8)
 
     def _renderizar(self, pw, ph, mensagens, estado, cerebro):
-        k = max(0.7, ph / 540.0)
-        f_txt, f_tit = _fonte(FONTE, int(17 * k)), _fonte(FONTE_NEGRITO, int(14 * k))
-        pad, gap = int(12 * k), int(8 * k)
-        img = Image.new("RGBA", (pw, ph), COR_FUNDO)
+        k = max(0.7, pw / 540.0)
+        f_txt, f_tit = _fonte(FONTE, int(20 * k)), _fonte(FONTE_NEGRITO, int(15 * k))
+        f_rot = _fonte(FONTE_NEGRITO, int(12 * k))
+        pad, gap = int(14 * k), int(10 * k)
+        raio = int(16 * k)
+        img = Image.new("RGBA", (pw, ph), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
 
-        # cabecalho: titulo + ponto de estado
-        cor_pt = COR_OK if estado == "pronto" else (COR_ERRO if estado == "erro" else COR_APAGADA)
-        d.ellipse([pad, pad + 3 * k, pad + 9 * k, pad + 12 * k], fill=cor_pt + (255,))
-        d.text((pad + 16 * k, pad - 1), self.titulo, font=f_tit, fill=COR_HUD + (255,))
-        if cerebro is False:
-            larg = d.textlength(TEXTO_SEM_CEREBRO, font=f_tit)
-            d.text((pw - pad - larg, pad - 1), TEXTO_SEM_CEREBRO, font=f_tit, fill=COR_ERRO + (255,))
-        topo = pad + int(24 * k)
-        d.line([(pad, topo), (pw - pad, topo)], fill=COR_HUD + (110,), width=1)
+        # corpo do painel: vidro escuro com cantos arredondados + faixa de brilho no topo
+        d.rounded_rectangle([0, 0, pw - 1, ph - 1], radius=raio, fill=COR_FUNDO,
+                            outline=COR_HUD + (150,), width=2)
+        topo = pad + int(26 * k)
+        faixa = Image.new("RGBA", (pw, topo), (0, 0, 0, 0))
+        fd = ImageDraw.Draw(faixa)
+        for yy in range(topo):
+            fd.line([(0, yy), (pw, yy)], fill=COR_HUD + (int(55 * (1 - yy / topo)),))
+        mascara = Image.new("L", (pw, ph), 0)
+        ImageDraw.Draw(mascara).rounded_rectangle([1, 1, pw - 2, ph - 2], radius=raio, fill=255)
+        corte = Image.new("RGBA", (pw, ph), (0, 0, 0, 0))
+        corte.paste(faixa, (0, 0))
+        img = Image.composite(Image.alpha_composite(img, corte), img, mascara)
+        d = ImageDraw.Draw(img)
 
-        area_h = ph - topo - pad
+        # cabecalho: ponto de estado com halo + titulo + status a direita
+        cor_pt = COR_OK if estado == "pronto" else (COR_ERRO if estado == "erro" else COR_APAGADA)
+        cy = pad + int(9 * k)
+        r = int(5 * k)
+        d.ellipse([pad - r + r, cy - r - int(4 * k), pad + 3 * r, cy + r + int(4 * k)],
+                  fill=cor_pt + (45,))
+        d.ellipse([pad + r - r // 1 + r // 2, cy - r // 1, pad + r + r // 1 + r // 2, cy + r // 1],
+                  fill=cor_pt + (255,))
+        d.text((pad + int(22 * k), pad), self.titulo, font=f_tit, fill=COR_HUD + (255,))
+        if cerebro is False:
+            txt, cor_st = TEXTO_SEM_CEREBRO, COR_ERRO
+        elif estado == "pronto":
+            txt, cor_st = "ao vivo", COR_OK
+        else:
+            txt, cor_st = "", COR_APAGADA
+        if txt:
+            larg = d.textlength(txt, font=f_rot)
+            d.text((pw - pad - larg, pad + int(3 * k)), txt, font=f_rot, fill=cor_st + (255,))
+        d.line([(pad, topo), (pw - pad, topo)], fill=COR_HUD + (90,), width=1)
+
+        area_h = ph - topo - 2 * pad
         largura_balao = pw - 2 * pad
-        interno = largura_balao - 2 * pad
         altura_linha = int(f_txt.size * 1.3)
+        h_rot = int(f_rot.size * 1.5)
+        barra = int(4 * k)
 
         if not mensagens:
             d.text((pad, topo + pad), TEXTOS_ESTADO.get(estado, ""), font=f_txt, fill=COR_APAGADA + (255,))
         else:
             # de baixo pra cima ate acabar o espaco; a mais antiga que couber
             # aparece mais apagada. Usuario a esquerda, robo a direita; o
-            # balao tem a largura do texto (ate 85% do painel).
-            maximo = int(largura_balao * 0.85) - 2 * pad
+            # balao tem a largura do texto (ate 88% do painel).
+            maximo = int(largura_balao * 0.88) - 2 * pad - barra
             blocos, usado = [], 0
             for autor, texto in reversed(mensagens):
-                linhas = _quebrar(d, texto, f_txt, maximo)[:6]
-                larg = int(max(d.textlength(l, font=f_txt) for l in linhas)) + 2 * pad
-                h = len(linhas) * altura_linha + 2 * int(pad * 0.7)
+                linhas = _quebrar(d, texto, f_txt, maximo)[:5]
+                larg = int(max(d.textlength(l, font=f_txt) for l in linhas)) + 2 * pad + barra
+                larg = max(larg, int(d.textlength("VOCÊ", font=f_rot)) + 2 * pad + barra)
+                h = len(linhas) * altura_linha + h_rot + 2 * int(pad * 0.6)
                 if usado + h > area_h:
                     break
                 blocos.append((autor, texto, linhas, larg, h))
@@ -111,16 +154,22 @@ class PainelTranscricao:
                 borda = COR_BORDA_ROBO if robo else COR_HUD
                 fundo = base[:3] + ((150 if mais_velha else base[3]),)
                 x = pw - pad - larg if robo else pad
-                d.rounded_rectangle([x, y, x + larg, y + h], radius=int(10 * k), fill=fundo,
-                                    outline=borda + ((90 if mais_velha else 200),), width=1)
+                d.rounded_rectangle([x, y, x + larg, y + h], radius=int(12 * k), fill=fundo,
+                                    outline=borda + ((70 if mais_velha else 140),), width=1)
+                # faixa de cor na lateral do balao (lado de fora: esq. usuario, dir. robo)
+                bx = x + larg - barra - 1 if robo else x + 1
+                d.rounded_rectangle([bx, y + int(8 * k), bx + barra, y + h - int(8 * k)],
+                                    radius=barra // 2, fill=borda + ((110 if mais_velha else 255),))
+                tx = x + pad + (0 if robo else barra)
+                ty = y + int(pad * 0.6)
+                d.text((tx, ty), "ROBÔ" if robo else "VOCÊ", font=f_rot,
+                       fill=borda + ((140 if mais_velha else 255),))
+                ty += h_rot
                 cor = COR_APAGADA if (texto == "…" or mais_velha) else COR_TEXTO
-                ty = y + int(pad * 0.7)
                 for linha in linhas:
-                    d.text((x + pad, ty), linha, font=f_txt, fill=cor + (255,))
+                    d.text((tx, ty), linha, font=f_txt, fill=cor + (255,))
                     ty += altura_linha
                 y += h + gap
-
-        d.rectangle([0, 0, pw - 1, ph - 1], outline=COR_HUD + (255,), width=1)
 
         rgba = np.asarray(img)
         alpha = rgba[..., 3:4].astype(np.uint16)

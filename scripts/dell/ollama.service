@@ -1,0 +1,10 @@
+[Unit]
+Description=Ollama (LLM local do robo)
+
+[Service]
+ExecStart=%h/.local/bin/ollama serve
+Environment=OLLAMA_KEEP_ALIVE=-1
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

@@ -42,20 +42,28 @@ import queue
 import threading
 import time
 
-try:
-    import numpy as np
-except ImportError:  # pragma: no cover
-    np = None
-
+from jetson.audio_prep import PreProcessador
 from jetson.mic_vad import ErroDeMic, OuvinteVAD
 
 MAX_MENSAGENS = 8
-TAXA_STT = 16000
 
 CHUNK_S = 0.05           # tamanho dos pedacos do OuvinteVAD
 DURACAO_MIN_S = 0.3      # trecho FALADO minimo (pedacos acima de PICO_MIN_RMS/2)
 PICO_MIN_RMS = 800       # volume (RMS de pedacos de 50 ms) que a frase precisa atingir
-CONF_MIN = 0.5           # confianca media das palavras (0-1) abaixo disso = descarta
+CONF_MIN = 0.7           # confianca media das palavras (0-1) abaixo disso = descarta
+AUDIO_DEBUG_DIR = os.path.expanduser(os.environ.get("LSA_AUDIO_DEBUG") or "~/dev/audio_debug")
+AUDIO_DEBUG_MAX = 150    # quantos WAVs guardar (os mais antigos saem)
+# Presenca durante a FRASE INTEIRA (nao so no instante em que ela fecha): sem isso, uma conversa
+# de fundo que termina quando alguem passa na frente da camera era aceita como se fosse dele.
+# A frase so vale se, nas amostras de presenca tiradas enquanto ela durou, pelo menos essa
+# fracao tinha alguem na frente do robo.
+PRESENCA_FRACAO_MIN = float(os.environ.get("LSA_PRESENCA_FRACAO") or 0.6)
+# Palavra unica so vale se for uma dessas (o resto e quase sempre o comeco de uma frase
+# cortada ou ruido que o Vosk transformou em palavra).
+PALAVRAS_SOLTAS_OK = frozenset([
+    "oi", "olá", "ola", "tchau", "obrigado", "obrigada", "valeu", "sim", "não", "nao",
+    "pare", "para", "silêncio", "silencio", "piada",
+])
 
 # O que o Vosk "escuta" em ruido: interjeicoes e palavras soltas curtas.
 INTERJEICOES = frozenset([
@@ -65,6 +73,22 @@ INTERJEICOES = frozenset([
 
 _AQUI = os.path.dirname(os.path.abspath(__file__))
 _WORKER = os.path.join(_AQUI, "stt_worker.py")
+_WORKER_WHISPER = os.path.join(_AQUI, "stt_worker_whisper.py")
+
+# Motor de reconhecimento: "whisper" (padrao; entende perguntas livres) ou "vosk"
+# (gramatica fechada do repertorio). Se o Whisper nao subir, cai pro Vosk.
+MOTOR = (os.environ.get("LSA_STT_ENGINE") or "whisper").lower()
+# A confianca do Whisper (exp da log-prob media) e menor que a do Vosk mesmo em
+# fala certa ("Voce e um robo" = 0.48); medido em audios reais: certos >= ~0.5,
+# errados <= ~0.4.
+CONF_MIN_WHISPER = float(os.environ.get("LSA_WHISPER_CONF_MIN") or 0.45)
+
+
+# O chat da tela se limpa sozinho a cada tanto tempo (segundos; 0 desliga). So limpa quando
+# ninguem esta falando e nao chegou mensagem nova ha um instante, pra nao apagar uma
+# resposta no meio da conversa; se nao puder, tenta de novo no quadro seguinte.
+LIMPAR_CHAT_SEGUNDOS = float(os.environ.get("LSA_CHAT_LIMPAR_SEGUNDOS") or 60)
+FOLGA_LIMPAR_SEGUNDOS = 8
 
 
 class ErroDeTranscricao(Exception):
@@ -86,16 +110,27 @@ def _env_worker():
     return env
 
 
-def _para_16k_mono(dados):
-    """Pedaco S16_LE 48 kHz estereo -> PCM S16_LE 16 kHz mono. Faz a media de
-    3 amostras (filtro passa-baixa simples) antes de decimar; o ratecv do
-    audioop pega 1 a cada 3 sem filtrar e o chiado aliasado atrapalha o Vosk."""
-    mono = audioop.tomono(dados, 2, 0.5, 0.5)
-    if np is None:
-        return audioop.ratecv(mono, 2, 1, 48000, TAXA_STT, None)[0]
-    x = np.frombuffer(mono, dtype=np.int16)
-    n = len(x) // 3 * 3
-    return (x[:n].reshape(-1, 3).astype(np.int32).sum(axis=1) // 3).astype(np.int16).tobytes()
+def _salvar_audio_debug(pedacos, texto, conf, pico, aceito):
+    """Guarda o WAV cru (48 kHz estereo) de cada frase capturada, com o que o Vosk
+    entendeu no nome, pra ouvir depois e ajustar ganho/limiar com dados reais."""
+    try:
+        import wave
+        os.makedirs(AUDIO_DEBUG_DIR, exist_ok=True)
+        limpo = "".join(c if c.isalnum() else "_" for c in (texto or "vazio"))[:40]
+        nome = "%s_%s_c%.2f_p%d_%s.wav" % (time.strftime("%H%M%S"), "ok" if aceito else "descartado",
+                                           conf, pico, limpo)
+        with wave.open(os.path.join(AUDIO_DEBUG_DIR, nome), "wb") as w:
+            w.setnchannels(2)
+            w.setsampwidth(2)
+            w.setframerate(48000)
+            w.writeframes(b"".join(pedacos))
+        # por data de modificacao: o nome comeca com HHMMSS e vira a meia-noite
+        antigos = sorted((os.path.join(AUDIO_DEBUG_DIR, n) for n in os.listdir(AUDIO_DEBUG_DIR)),
+                         key=os.path.getmtime)
+        for velho in antigos[:-AUDIO_DEBUG_MAX]:
+            os.remove(velho)
+    except Exception as e:
+        print("[transcritor] nao salvou audio de debug: %s" % e, flush=True)
 
 
 def _so_interjeicoes(texto):
@@ -118,6 +153,9 @@ class ClienteTranscricao:
         do terminal `camera`), sem ouvinte — pra quando o microfone da PrimeSense
         esta fora do ar. Um ouvinte pode entrar depois com trocar_ouvinte()."""
         self._modelo = modelo or _pasta_modelo()
+        self._motor = MOTOR
+        self._conf_min = CONF_MIN_WHISPER if self._motor == "whisper" else CONF_MIN
+        # o Vosk e a reserva do Whisper, entao o modelo dele continua sendo exigido
         if not os.path.isdir(self._modelo):
             raise ErroDeTranscricao("modelo Vosk nao encontrado em %s" % self._modelo)
 
@@ -129,11 +167,14 @@ class ClienteTranscricao:
 
         self._lock = threading.Lock()
         self._mensagens = []
+        self._ultima_limpeza = time.monotonic()   # chat da tela: ver LIMPAR_CHAT_SEGUNDOS
+        self._ultima_mensagem = 0.0
         self._registro = []        # (seq, autor, texto) numerado, pro terminal `camera`
         self._seq = 0
         self._estado = "carregando"
         self._parcial = ""
         self._conversa = None      # ClienteConversa (Jetson 1), opcional
+        self._presenca = None      # funcao() -> bool: ha alguem na frente? (None = nao checa)
         self.conversa_ativa = True # False: a fala do mic so aparece na tela, nao vai ao cerebro
         self._mudo_extra = None
         self._estava_mudo = False
@@ -150,8 +191,29 @@ class ClienteTranscricao:
             self._ouvinte.definir_ao_audio(self._ao_audio)
 
     # ── consulta (thread do video) ─────────────────────────────────────
+    def limpar_chat(self):
+        """Apaga as bolhas da tela. O registro do terminal `camera` e o historico do
+        cerebro (memoria.db) continuam intactos."""
+        with self._lock:
+            self._mensagens.clear()
+            self._ultima_limpeza = time.monotonic()
+
+    def _limpeza_automatica(self):
+        """Chamada a cada quadro por mensagens(); limpa o chat a cada LIMPAR_CHAT_SEGUNDOS."""
+        if LIMPAR_CHAT_SEGUNDOS <= 0:
+            return
+        agora = time.monotonic()
+        if agora - self._ultima_limpeza < LIMPAR_CHAT_SEGUNDOS:
+            return
+        if not self._mensagens:
+            self._ultima_limpeza = agora       # nada a apagar; recomeca a contagem
+        elif not self._parcial and agora - self._ultima_mensagem >= FOLGA_LIMPAR_SEGUNDOS:
+            self._mensagens.clear()
+            self._ultima_limpeza = agora
+
     def mensagens(self):
         with self._lock:
+            self._limpeza_automatica()
             msgs = list(self._mensagens)
             if self._parcial:
                 msgs.append(("usuario", self._parcial))
@@ -165,6 +227,12 @@ class ClienteTranscricao:
         """Liga ao cerebro da Jetson 1 (jetson/conversa_client.py): cada frase
         transcrita e enviada a ele e o microfone fica mudo enquanto o robo fala."""
         self._conversa = conversa
+
+    def definir_presenca(self, funcao):
+        """funcao() -> True se ha alguem na frente do robo agora. Quando devolve False a frase
+        capturada e descartada SEM transcrever (nao gasta CPU) e nao vai ao cerebro: e assim
+        que o robo ignora a conversa de fundo. None desliga a checagem."""
+        self._presenca = funcao
 
     def trocar_ouvinte(self, novo):
         """Passa a escutar `novo` (um OuvinteVAD) no lugar do atual, ou nenhum (None).
@@ -195,6 +263,7 @@ class ClienteTranscricao:
         """Acrescenta uma bolha ("usuario" ou "robo") a conversa mostrada na tela."""
         with self._lock:
             self._mensagens.append((autor, texto))
+            self._ultima_mensagem = time.monotonic()
             if len(self._mensagens) > MAX_MENSAGENS:
                 self._mensagens.pop(0)
             self._seq += 1
@@ -243,13 +312,23 @@ class ClienteTranscricao:
             ouvinte.proxima_fala(timeout=1.0)
 
     # ── worker ─────────────────────────────────────────────────────────
-    def _iniciar_worker(self):
+    def _subir(self, argv):
         self._proc = subprocess.Popen(
-            [sys.executable, _WORKER, self._modelo],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             env=_env_worker())
-        linha = self._proc.stdout.readline()
-        if linha.strip() != b"PRONTO":
+        return self._proc.stdout.readline().strip() == b"PRONTO"
+
+    def _iniciar_worker(self):
+        if self._motor == "whisper":
+            if self._subir([sys.executable, _WORKER_WHISPER]):
+                return
+            print("[transcritor] Whisper nao subiu; usando o Vosk", flush=True)
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+            self._motor, self._conf_min = "vosk", CONF_MIN
+        if not self._subir([sys.executable, _WORKER, self._modelo]):
             raise ErroDeTranscricao("Vosk nao iniciou (worker saiu sem dizer PRONTO)")
 
     def _pedir(self, cmd, pcm=b""):
@@ -265,6 +344,27 @@ class ClienteTranscricao:
         return json.loads(linha.decode("utf-8"))
 
     def _loop(self):
+        """Religa o worker do Vosk se ele cair (antes a transcricao morria ate
+        reiniciar o app — e reiniciar o app costuma travar o mic da PrimeSense)."""
+        falhas = 0
+        while self._rodando:
+            inicio = time.time()
+            self._sessao()
+            if not self._rodando:
+                break
+            if self._proc is not None:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+            falhas = 0 if time.time() - inicio > 60 else falhas + 1
+            if falhas >= 5:
+                print("[transcritor] o Vosk caiu 5 vezes seguidas; desisti", flush=True)
+                return
+            print("[transcritor] religando o Vosk...", flush=True)
+            time.sleep(2)
+
+    def _sessao(self):
         try:
             self._iniciar_worker()
         except (ErroDeTranscricao, OSError) as e:
@@ -272,10 +372,14 @@ class ClienteTranscricao:
             self._set(estado="erro")
             return
         self._set(estado="pronto")
-        print("[transcritor] pronto (modelo %s)" % os.path.basename(self._modelo), flush=True)
+        print("[transcritor] pronto (%s)" % ("whisper-" + (os.environ.get("LSA_WHISPER_MODEL") or "small")
+                                         if self._motor == "whisper" else "modelo " + os.path.basename(self._modelo)), flush=True)
 
         ativa = False
         pico = falados = 0
+        amostras_presenca = []
+        audio_frase = []
+        prep = PreProcessador()   # filtros + AGC com estado; reiniciado a cada frase
         try:
             while self._rodando:
                 try:
@@ -289,7 +393,10 @@ class ClienteTranscricao:
                     continue
                 if evento == "inicio":
                     self._pedir(b"S")
+                    prep.resetar()
                     ativa, pico, falados = True, 0, 0
+                    amostras_presenca = []
+                    audio_frase = []
                     evento = "chunk"
                 if evento == "chunk" and ativa:
                     # junta o que ja estiver na fila num envio so (se o Vosk
@@ -305,25 +412,45 @@ class ClienteTranscricao:
                         else:               # inicio/fim: volta pra fila em ordem
                             self._eventos.queue.appendleft((ev2, d2))
                             break
+                    audio_frase.extend(pedacos)
+                    if self._presenca is not None:
+                        try:
+                            amostras_presenca.append(bool(self._presenca()))
+                        except Exception:
+                            pass
                     for p in pedacos:
                         for i in range(0, len(p), 9600):
                             r = audioop.rms(p[i:i + 9600], 2)
                             pico = max(pico, r)
                             falados += r >= PICO_MIN_RMS / 2
-                    resp = self._pedir(b"C", _para_16k_mono(b"".join(pedacos)))
+                    resp = self._pedir(b"C", prep.processar(b"".join(pedacos)))
                     parcial = resp.get("parcial", "")
                     self._set(parcial=parcial if parcial and not _so_interjeicoes(parcial) else "")
                 elif evento == "fim" and ativa:
                     ativa = False
                     t0 = time.time()
+                    presenca = self._presenca
+                    if presenca is not None:
+                        amostras_presenca.append(bool(presenca()))
+                        fracao = sum(amostras_presenca) / float(len(amostras_presenca))
+                        if not amostras_presenca[-1] or fracao < PRESENCA_FRACAO_MIN:
+                            self._set(parcial="")
+                            print("[transcritor] descartado (ninguem na frente durante a fala: %.0f%% das amostras) "
+                                  "falado=%.2fs" % (100 * fracao, falados * CHUNK_S), flush=True)
+                            continue
                     resp = self._pedir(b"E")
                     self._set(parcial="")
                     texto, conf = resp.get("texto", ""), float(resp.get("conf", 0.0))
                     dur = falados * CHUNK_S
+                    palavras = texto.lower().split()
+                    solta = len(palavras) == 1 and palavras[0] not in PALAVRAS_SOLTAS_OK
+                    aceito = not (dur < DURACAO_MIN_S or pico < PICO_MIN_RMS or not texto
+                                  or conf < self._conf_min or _so_interjeicoes(texto) or solta)
+                    _salvar_audio_debug(audio_frase, texto, conf, pico, aceito)
                     if dur < DURACAO_MIN_S or pico < PICO_MIN_RMS:
                         print("[transcritor] descartado (ruido) falado=%.2fs pico=%d texto=%r" % (
                             dur, pico, texto), flush=True)
-                    elif not texto or conf < CONF_MIN or _so_interjeicoes(texto):
+                    elif not texto or conf < self._conf_min or _so_interjeicoes(texto) or solta:
                         print("[transcritor] descartado %r conf=%.2f falado=%.2fs pico=%d" % (
                             texto, conf, dur, pico), flush=True)
                     else:

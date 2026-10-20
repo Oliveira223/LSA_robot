@@ -32,3 +32,9 @@ graphify-out/
 
 # Pesos do YOLO (baixados, ~230 MB)
 model-weights/
+
+# Backups locais
+*.bak-*
+
+# venv do MediaPipe (~500 MB)
+venv_mp/

@@ -49,7 +49,7 @@ while [ $((SECONDS - inicio)) -lt "$LIMITE_S" ]; do
         continue
     fi
     status "CAMERA DETECTADA\nINICIANDO..."
-    if "$DIR/camera-simples" start; then
+    if "$DIR/camera" start; then
         sleep 3            # deixa a janela do app aparecer antes de tirar a de espera
         kill "$ESPERA" 2>/dev/null
         exit 0

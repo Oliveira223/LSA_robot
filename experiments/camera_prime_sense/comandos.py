@@ -9,6 +9,12 @@ ValueError vira mensagem de erro limpa pro usuario.
     digitar <texto>              injeta a frase como se tivesse sido falada
     reiniciar mic                recria o ouvinte do microfone dentro do app
     chat [on|off]                liga/desliga o envio da fala do microfone ao cerebro
+    faces [on|off]               liga/desliga a deteccao de rosto (YOLO)
+    body [on|off|M]              liga/desliga a deteccao de corpo (esqueleto, MediaPipe) ou muda a distancia maxima
+    vision [on|off]              liga/desliga as DUAS (rosto e corpo) de uma vez
+    presence [on|off|M]          so responde a fala com alguem na frente (a ate M metros)
+    mic [xtion|embutido|auto]    escolhe o microfone; auto = Xtion e, se travar, o embutido do PC
+    brain [ollama|claude|modelo X]  troca quem responde: Ollama (Jetson 1) ou Claude Code local
     shush                        interrompe a fala do robo agora
     ouvir <seq>                  (interno) mensagens novas, pra transcrever/conversar
 
@@ -25,11 +31,19 @@ def _faixa(s):
 
 
 def registrar_comandos(servidor, args, saudador, mic, transcritor, conversa,
-                       leitor_depth, detector, criar_ouvinte=None, erro_de_mic=Exception):
+                       leitor_depth, rosto, criar_detector=None, criar_ouvinte=None,
+                       erro_de_mic=Exception, corpo=None, criar_corpo=None,
+                       presenca=None, trocar_mic=None):
     """`mic` e um holder com o atributo `ouvinte` (o app le dele a cada quadro),
     pra o comando `reiniciar mic` poder trocar o ouvinte sem reabrir o app.
     `criar_ouvinte` e uma funcao sem argumentos que devolve um OuvinteVAD novo
-    (None quando o mic esta desligado por flag)."""
+    (None quando o mic esta desligado por flag).
+    `rosto` e um holder com o atributo `detector` (o app le dele a cada quadro),
+    pra o comando `faces` desligar/religar a deteccao de rosto sem reabrir o app.
+    `corpo` e o holder equivalente (atributo `detector`) da deteccao de corpo (MediaPipe) e
+    `criar_corpo` cria um DetectorCorpo novo: servem aos comandos `body` e `vision`.
+    `presenca` (presenca.Presenca) serve ao comando `presence`; `trocar_mic(fonte)` troca a fonte do
+    microfone ("xtion"/"embutido") e serve ao comando `mic`."""
     inicio = time.time()
 
     def cmd_status(_arg):
@@ -42,12 +56,28 @@ def registrar_comandos(servidor, args, saudador, mic, transcritor, conversa,
             linhas.append("profundidade: " + ("ok" if ok else
                           "SEM QUADROS (distancia indisponivel; replugue o cabo USB)"))
 
+        detector = rosto.detector
         if detector is None:
             linhas.append("rostos: detector desligado")
         else:
             linhas.append("rostos: %d no quadro" % len(detector.alvos()))
 
-        linhas.append("microfone: " + _estado_mic(mic.ouvinte, criar_ouvinte is not None))
+        if corpo is not None:
+            c = corpo.detector
+            if c is None:
+                linhas.append("corpo: detector desligado")
+            elif not c.pronto:
+                linhas.append("corpo: " + ("INDISPONIVEL (%s)" % c.erro if c.erro else "carregando o modelo..."))
+            else:
+                lim = getattr(corpo, "dist_max", 0)
+                n = getattr(corpo, "visiveis", None)
+                linhas.append("corpo: %d no quadro%s" % (len(c.poses()) if n is None else n,
+                                                          " (so ate %.1f m)" % lim if lim else ""))
+
+        linhas.append("microfone: " + _estado_mic(mic.ouvinte, criar_ouvinte is not None) +
+                      " [fonte: %s, modo %s]" % (_nome_fonte(mic), getattr(mic, "modo", "auto")))
+        if presenca is not None:
+            linhas.append("presenca: " + presenca.estado())
 
         if transcritor is None:
             linhas.append("transcricao: desligada")
@@ -57,6 +87,8 @@ def registrar_comandos(servidor, args, saudador, mic, transcritor, conversa,
         if conversa is not None:
             linhas.append("cerebro (Jetson 1): " + ("conectado" if conversa.conectado()
                                                      else "desconectado"))
+        if conversa is not None:
+            linhas.append("quem responde: " + _estado_brain(conversa))
         if conversa is not None and conversa.conectado():
             linhas.append("voz: " + ("robo (Piper, Jetson 1)" if conversa.suporta_falar() else
                           "local (voz robotica; o servidor da Jetson 1 esta desatualizado)"))
@@ -180,6 +212,144 @@ def registrar_comandos(servidor, args, saudador, mic, transcritor, conversa,
         return "conversa por voz: " + ("LIGADA" if transcritor.conversa_ativa else
                                        "DESLIGADA (o microfone so transcreve; `type` ainda responde)")
 
+    def cmd_faces(arg):
+        acao = arg.strip().lower()
+        if acao == "off" and rosto.detector is not None:
+            detector, rosto.detector = rosto.detector, None   # o app para de usar ja no proximo quadro
+            detector.parar()                                  # encerra o processo (libera GPU/CPU/RAM)
+            print("[rosto] deteccao desligada pelo terminal", flush=True)
+        elif acao == "on" and rosto.detector is None:
+            if criar_detector is None:
+                raise ValueError("deteccao de rosto indisponivel neste app")
+            rosto.detector = criar_detector()
+            if rosto.detector is None:
+                raise ValueError("nao achei o modelo de rosto (veja o log)")
+            print("[rosto] deteccao ligada pelo terminal", flush=True)
+        elif acao not in ("", "on", "off"):
+            raise ValueError("uso: faces [on|off]")
+        return "deteccao de rosto: " + ("LIGADA" if rosto.detector is not None else
+                                        "DESLIGADA (sem caixas, distancia nem saudacao)")
+
+    def _ligar_faces(ligar):
+        if not ligar and rosto.detector is not None:
+            detector, rosto.detector = rosto.detector, None
+            detector.parar()
+            print("[rosto] deteccao desligada pelo terminal", flush=True)
+        elif ligar and rosto.detector is None:
+            if criar_detector is None:
+                raise ValueError("deteccao de rosto indisponivel neste app")
+            rosto.detector = criar_detector()
+            if rosto.detector is None:
+                raise ValueError("nao achei o modelo de rosto (veja o log)")
+            print("[rosto] deteccao ligada pelo terminal", flush=True)
+
+    def _ligar_corpo(ligar):
+        if corpo is None:
+            raise ValueError("deteccao de corpo indisponivel neste app (MediaPipe nao instalado)")
+        if not ligar and corpo.detector is not None:
+            detector, corpo.detector = corpo.detector, None   # o app para de desenhar ja no proximo quadro
+            detector.parar()                                  # encerra o worker (libera CPU/RAM)
+            print("[corpo] deteccao desligada pelo terminal", flush=True)
+        elif ligar and corpo.detector is None:
+            if criar_corpo is None:
+                raise ValueError("deteccao de corpo indisponivel neste app")
+            corpo.detector = criar_corpo()
+            if corpo.detector is None:
+                raise ValueError("nao achei o MediaPipe/modelo de corpo (veja `help body`)")
+            print("[corpo] deteccao ligada pelo terminal", flush=True)
+
+    def _texto_corpo():
+        if corpo is None or corpo.detector is None:
+            return "DESLIGADA (sem esqueleto)"
+        d = corpo.detector
+        lim = getattr(corpo, "dist_max", 0)
+        return "LIGADA" + ("" if d.pronto else " (carregando o modelo...)") + (
+            " (so ate %.1f m)" % lim if lim else " (sem limite de distancia)")
+
+    def cmd_body(arg):
+        acao = arg.strip().lower()
+        if acao not in ("", "on", "off"):
+            try:
+                metros = float(acao.replace(",", ".").rstrip("m").strip())
+            except ValueError:
+                raise ValueError("uso: body [on|off|<metros>]")
+            if corpo is None:
+                raise ValueError("deteccao de corpo indisponivel neste app (MediaPipe nao instalado)")
+            if not (metros == 0 or 0.5 <= metros <= 8.0):
+                raise ValueError("a distancia do corpo tem que ficar entre 0.5 e 8 m (0 = sem limite)")
+            corpo.dist_max = metros
+            acao = "on"
+        if acao:
+            _ligar_corpo(acao == "on")
+        return "deteccao de corpo: " + _texto_corpo()
+
+    def cmd_vision(arg):
+        acao = arg.strip().lower()
+        if acao not in ("", "on", "off"):
+            raise ValueError("uso: vision [on|off]")
+        if acao:
+            _ligar_faces(acao == "on")
+            if corpo is not None:
+                _ligar_corpo(acao == "on")
+        return "rosto (YOLO): %s\ncorpo (MediaPipe): %s" % (
+            "LIGADA" if rosto.detector is not None else "DESLIGADA", _texto_corpo())
+
+    def cmd_presence(arg):
+        if presenca is None:
+            raise ValueError("a checagem de presenca nao esta disponivel neste app")
+        acao = arg.strip().lower()
+        if acao in ("on", "off"):
+            presenca.ativo = acao == "on"
+            print("[presenca] checagem %s pelo terminal" % ("ligada" if presenca.ativo else "desligada"), flush=True)
+        elif acao:
+            try:
+                metros = float(acao.replace(",", ".").rstrip("m").strip())
+            except ValueError:
+                raise ValueError("uso: presence [on|off|<metros>]")
+            if not 0.5 <= metros <= 8.0:
+                raise ValueError("a distancia da presenca tem que ficar entre 0.5 e 8 m")
+            presenca.dist_max = metros
+            presenca.ativo = True
+        return "presenca: " + presenca.estado()
+
+    def cmd_mic(arg):
+        if trocar_mic is None or criar_ouvinte is None:
+            raise ValueError("o microfone esta desligado neste modo (--no-mic ou --mic-mock)")
+        acao = arg.strip().lower()
+        if acao not in ("", "xtion", "embutido", "auto"):
+            raise ValueError("uso: mic [xtion|embutido|auto]")
+        if acao:
+            mic.modo = acao
+            alvo = "embutido" if acao == "embutido" else "xtion"
+            vivo = mic.ouvinte is not None and mic.ouvinte.estado()[3]
+            if mic.fonte != alvo or not vivo:
+                try:
+                    novo = trocar_mic(alvo)
+                except erro_de_mic as e:
+                    raise ValueError("nao consegui abrir o microfone %s: %s" % (alvo, e))
+                limite = time.time() + 8.0
+                while time.time() < limite and novo.estado()[3] and len(novo.amostras_recentes()) == 0:
+                    time.sleep(0.3)
+                if len(novo.amostras_recentes()) == 0:
+                    return ("microfone %s aberto, mas NENHUM audio chegou ainda%s" % (
+                        alvo, " (o audio USB do Xtion costuma travar: modo auto volta ao embutido sozinho)"
+                        if alvo == "xtion" else ""))
+        return "microfone: " + _estado_mic(mic.ouvinte, True) + " [fonte: %s, modo %s]" % (_nome_fonte(mic), mic.modo)
+
+    def cmd_brain(arg):
+        if conversa is None:
+            raise ValueError("nao ha conversa com o cerebro (--no-cerebro)")
+        partes = arg.split()
+        if partes and partes[0].lower() == "modelo":
+            if len(partes) != 2:
+                raise ValueError("uso: brain modelo <haiku|sonnet|opus|id>")
+            conversa.modelo_claude(partes[1])
+        elif partes:
+            if len(partes) != 1 or partes[0].lower() not in ("ollama", "claude"):
+                raise ValueError("uso: brain [ollama|claude|modelo <nome>]")
+            conversa.definir_cerebro(partes[0].lower())
+        return _estado_brain(conversa)
+
     def cmd_shush(arg):
         if arg:
             raise ValueError("shush nao tem argumentos: ele so corta a fala de agora (a proxima "
@@ -194,12 +364,30 @@ def registrar_comandos(servidor, args, saudador, mic, transcritor, conversa,
 
     servidor.registrar("status", cmd_status)
     servidor.registrar("chat", cmd_chat)
+    servidor.registrar("faces", cmd_faces)
+    servidor.registrar("presence", cmd_presence)
+    servidor.registrar("mic", cmd_mic)
+    servidor.registrar("body", cmd_body)
+    servidor.registrar("vision", cmd_vision)
+    servidor.registrar("brain", cmd_brain)
     servidor.registrar("shush", cmd_shush)
     servidor.registrar("reiniciar_mic", cmd_reiniciar_mic)
     servidor.registrar("ouvir", cmd_ouvir)
     servidor.registrar("saudar", cmd_saudar)
     servidor.registrar("falar", cmd_falar)
     servidor.registrar("digitar", cmd_digitar)
+
+
+def _nome_fonte(mic):
+    if mic.ouvinte is None:
+        return "nenhuma"
+    return "embutido do PC" if getattr(mic, "fonte", "xtion") == "embutido" else "Xtion/PrimeSense"
+
+
+def _estado_brain(conversa):
+    if conversa.cerebro() == "claude":
+        return "CLAUDE CODE local (modelo %s; a voz ainda e o Piper da Jetson 1)" % conversa.modelo_claude()
+    return "Ollama (Jetson 1)"
 
 
 def _estado_mic(ouvinte, pode_reiniciar):

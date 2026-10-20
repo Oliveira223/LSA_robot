@@ -37,11 +37,16 @@ camera_log.instalar()          # ja aqui: os avisos de import tambem saem com da
 
 import cv2
 import numpy as np
-from primesense import openni2
+try:
+    from primesense import openni2
+except ImportError:             # PC sem PrimeSense: usa a webcam (ver iniciar_sensor)
+    openni2 = None
 
 from camera_utils import (HUD_AMARELO, HUD_CIANO, HudTela, MedidorDistancia,
+                          WebcamCor, achar_webcam,
                           configurar_cor, configurar_depth, criar_detector_rosto,
-                          desenhar_alvos_hud, localizar_openni2_redist)
+                          desenhar_alvos_hud, localizar_openni2_redist,
+                          profundidade_mediana_mm)
 
 from comandos import registrar_comandos
 from controle import ServidorControle
@@ -77,6 +82,18 @@ except Exception as _erro_import_stt:
     ClienteTranscricao = None
     ErroDeTranscricao = Exception
     PainelTranscricao = None
+try:
+    from painel_log import PainelLog
+except Exception:
+    PainelLog = None
+try:
+    from presenca import Presenca, profundidade_corpo_m
+except Exception:
+    Presenca = None
+try:
+    from corpo import DetectorCorpo, desenhar_corpos, disponivel as corpo_disponivel
+except Exception:
+    DetectorCorpo = None
     ClienteConversa, HOST_PADRAO, PORTA_PADRAO = None, "10.10.10.1", 5005
     print(f"AVISO: transcricao local indisponivel ({_erro_import_stt}); "
           "seguindo sem janela de texto.", file=sys.stderr)
@@ -88,13 +105,36 @@ except Exception as _erro_import_chat:
     print(f"AVISO: jetson.chat_client indisponivel ({_erro_import_chat}); "
           "seguindo sem chat.", file=sys.stderr)
 # ─── Sensor ─────────────────────────────────────────────────────────────
-def iniciar_sensor(res="auto", distancia=True):
-    """So abre o stream de cor. O stream de profundidade nao e mais usado
+def iniciar_sensor(res="auto", distancia=True, camera="auto", webcam=None):
+    """Abre a camera. `camera`: "primesense", "webcam" ou "auto" (PrimeSense se o
+    OpenNI2 abrir um dispositivo; senao a webcam). A webcam nao tem profundidade.
+
+    PrimeSense: so abre o stream de cor. O stream de profundidade nao e mais usado
     (a miniatura do canto agora e o grafico de som, nao a profundidade) —
     fora de nao servir mais pra nada aqui, era a parte mais pesada de CPU
     (inpaint, Canny, normalizacao por percentil a cada frame) e mais
     instavel do sensor nessa Jetson (trava/precisa de replug com
     frequencia)."""
+    if camera != "webcam" and openni2 is not None:
+        try:
+            return _iniciar_primesense(res, distancia)
+        except Exception as e:
+            if camera == "primesense":
+                raise
+            print(f"AVISO: PrimeSense indisponivel ({e}); usando a webcam.", file=sys.stderr)
+            try:
+                openni2.unload()
+            except Exception:
+                pass
+    elif camera == "primesense":
+        raise RuntimeError("--camera primesense, mas o pacote primesense nao esta instalado")
+    indice = webcam if webcam is not None else achar_webcam()
+    if indice is None:
+        raise RuntimeError("nenhuma webcam encontrada em /dev/video*")
+    return None, WebcamCor(indice, res), None
+
+
+def _iniciar_primesense(res, distancia):
     openni2.initialize(localizar_openni2_redist())
     dev = openni2.Device.open_any()
     color_stream = dev.create_color_stream()
@@ -126,13 +166,16 @@ def parar_sensor(color_stream, depth_stream=None):
         except Exception:
             pass
     try:
-        openni2.unload()
+        if openni2 is not None:
+            openni2.unload()
     except Exception:
         pass
 
 
 # ─── Leitura de frames ──────────────────────────────────────────────────
 def ler_color(color_stream):
+    if isinstance(color_stream, WebcamCor):
+        return color_stream.ler()
     frame = color_stream.read_frame()
     img = np.frombuffer(frame.get_buffer_as_uint8(), dtype=np.uint8)
     img = img.reshape(frame.height, frame.width, 3)
@@ -407,6 +450,20 @@ def _on_sigterm(signum, frame):
 
 
 def _tela_cheia_wnck(titulo):
+    # Openbox + backend Qt: o OpenCV consegue a tela cheia sozinho (o caminho
+    # libwnck abaixo falha em silencio fora do Unity)
+    try:
+        cv2.setWindowProperty(titulo, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    except Exception:
+        pass
+    if not os.path.exists("/usr/lib/python3/dist-packages/gi"):
+        # sem libwnck/Unity (PC com outro gerenciador de janelas): o OpenCV
+        # consegue a tela cheia sozinho
+        try:
+            cv2.setWindowProperty(titulo, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        except Exception:
+            pass
+        return
     codigo = (
         "import gi\n"
         "gi.require_version('Wnck','3.0')\n"
@@ -506,8 +563,26 @@ def main():
                      help="confianca minima da deteccao de rosto (padrao 0.5)")
     ap.add_argument("--espera", action="store_true",
                      help="so mostra a tela 'aguardando a camera' (usada pelo autostart)")
+    ap.add_argument("--camera", choices=("auto", "primesense", "webcam"), default="auto",
+                     help="fonte de video: auto (PrimeSense se houver, senao a webcam do PC)")
+    ap.add_argument("--webcam", type=int, default=None, metavar="N",
+                     help="indice /dev/videoN da webcam (padrao: a primeira que entrega imagem)")
     ap.add_argument("--no-distancia", action="store_true",
                      help="nao le a profundidade (sem a distancia dos rostos)")
+    ap.add_argument("--no-presenca", action="store_true",
+                     help="o robo responde a qualquer fala, mesmo sem ninguem na frente")
+    ap.add_argument("--presenca-dist", type=float, default=2.3, metavar="M",
+                     help="distancia maxima (m) em que alguem conta como 'na frente': o robo so "
+                          "responde e fala com alguem a ate essa distancia (padrao 2.3)")
+    ap.add_argument("--mic", choices=("auto", "xtion", "embutido"), default="auto",
+                     help="fonte do microfone: auto = Xtion e, se ele travar, o embutido do PC (padrao)")
+    ap.add_argument("--corpo-dist", type=float, default=2.5, metavar="M",
+                     help="so detecta o corpo (esqueleto) de quem esta a ate M metros (padrao 2.5; "
+                          "0 = sem limite)")
+    ap.add_argument("--no-corpo", action="store_true",
+                     help="desliga a deteccao de corpo (esqueleto, MediaPipe)")
+    ap.add_argument("--no-log-tela", action="store_true",
+                     help="desliga o feed de logs rolando na lateral esquerda da tela")
     ap.add_argument("--no-mic", action="store_true",
                      help="desliga o grafico de nivel do microfone")
     ap.add_argument("--mic-limiar", type=int, default=None,
@@ -515,7 +590,7 @@ def main():
     ap.add_argument("--mic-ganho", type=int, default=2300,
                      help="ganho de captura do mic da PrimeSense, 0-4182 (padrao 2300; "
                           "o do mic_vad e 1700 e exigia falar alto; 3576 de fabrica satura)")
-    ap.add_argument("--mic-silencio", type=float, default=0.6,
+    ap.add_argument("--mic-silencio", type=float, default=1.0,
                      help="segundos de silencio pra fechar a frase (padrao 0.6)")
     ap.add_argument("--mic-mock", action="store_true",
                      help="grafico de onda com dados SIMULADOS (jetson.mic_mock), sem "
@@ -563,6 +638,15 @@ def main():
           flush=True)
 
     detector = None if args.no_faces else criar_detector_rosto(args.face_size, args.face_conf)
+    def criar_corpo():
+        if DetectorCorpo is None or not corpo_disponivel():
+            return None
+        return DetectorCorpo()      # worker no venv_mp; se nao subir, so nao desenha
+    # `body on|off` troca o detector; `body <metros>` muda dist_max (0 = sem limite)
+    corpo_h = types.SimpleNamespace(detector=None if args.no_corpo else criar_corpo(),
+                                    dist_max=args.corpo_dist)
+    n_corpos = {"n": 0}
+    rosto = types.SimpleNamespace(detector=detector)   # o comando `faces` liga/desliga aqui
 
     # OpenNI2 abre a interface de video da PrimeSense PRIMEIRO, sem nada mais
     # mexendo no mesmo dispositivo USB ao mesmo tempo — visto na pratica
@@ -575,19 +659,29 @@ def main():
     # abre logo apos o video, mesmo sozinho — sem o video aberto junto —
     # funciona sempre; parece precisar de um respiro no barramento USB
     # depois que o stream de video comeca a transferir de verdade).
-    if preparar_mic is not None and not args.no_mic and not args.mic_mock:
+    if preparar_mic is not None and not args.no_mic and not args.mic_mock and args.mic != "embutido":
         preparar_mic()   # antes do video: ver o motivo em jetson.mic_vad.preparar_mic
-    _dev, color_stream, depth_stream = iniciar_sensor(args.res, not args.no_distancia)
+    _dev, color_stream, depth_stream = iniciar_sensor(
+        args.res, not args.no_distancia, args.camera, args.webcam)
     medidor = MedidorDistancia() if depth_stream is not None else None
     leitor_depth = LeitorDepth(depth_stream) if depth_stream is not None else None
     time.sleep(1.5)
     visual_som = VisualizadorSom()
 
-    def criar_ouvinte():
+    # `fonte` = de onde o ouvinte realmente le ("xtion" ou "embutido"); `modo` = o que o usuario
+    # pediu (auto: Xtion e, se ele travar, o microfone embutido do PC)
+    mic = types.SimpleNamespace(ouvinte=None, fonte="xtion", modo=args.mic)
+
+    def criar_ouvinte(fonte=None):
+        fonte = fonte or ("embutido" if mic.modo == "embutido" else "xtion")
         kwargs = {"ganho": args.mic_ganho, "silencio_s": args.mic_silencio}
         if args.mic_limiar:
             kwargs["limiar_fala"] = args.mic_limiar
-        return OuvinteVAD(**kwargs)
+        if fonte == "embutido":
+            kwargs["embutido"] = True
+        novo = OuvinteVAD(**kwargs)
+        mic.fonte = fonte
+        return novo
 
     ouvinte = None
     if args.mic_mock:
@@ -602,11 +696,21 @@ def main():
         except ErroDeMic as e:
             print(f"AVISO: microfone indisponivel ({e}); seguindo sem indicador de mic.",
                   file=sys.stderr)
+            if mic.modo == "auto":
+                try:
+                    ouvinte = criar_ouvinte("embutido")
+                    print("[mic] Xtion indisponivel; usando o microfone embutido do PC", flush=True)
+                except ErroDeMic as e2:
+                    print(f"AVISO: o microfone embutido tambem falhou ({e2}).", file=sys.stderr)
+    mic.ouvinte = ouvinte
 
     if args.no_chat:
         args.stt = "off"
 
     transcritor = painel_texto = conversa = None
+    painel_log = PainelLog() if (PainelLog is not None and not args.no_log_tela) else None
+    ids_log = {"ids": set()}   # rostos ja anunciados no feed de logs
+    ref_prof, ref_saltos = {}, {}   # profundidade de referencia por alvo (deteccao de objeto na frente)
     if args.stt == "local" and not args.mic_mock:
         if ClienteTranscricao is None:
             pass  # o aviso do import ja foi impresso
@@ -639,18 +743,78 @@ def main():
     saudador = Saudador(args.saudar_texto, args.saudar_dist_min, args.saudar_dist_max,
                         args.saudar_intervalo, ativo=args.saudar and saudavel,
                         disponivel=saudavel)
+    presenca = Presenca(ativo=not args.no_presenca, dist_max=args.presenca_dist) if Presenca is not None else None
+    estado_pres = {"v": None}
     if transcritor is not None:
         transcritor.definir_mudo_extra(saudador.falando)
+        if presenca is not None:
+            transcritor.definir_presenca(presenca.presente)   # so responde com alguem na frente
+    if conversa is not None and presenca is not None:
+        conversa.definir_presenca(presenca.presente)          # e so fala (toca audio) com alguem na frente
     if conversa is not None:
         saudador.definir_voz_cerebro(conversa.falar_literal)   # mesma voz das respostas
 
-    mic = types.SimpleNamespace(ouvinte=ouvinte)   # o `reiniciar mic` troca o ouvinte aqui
     pode_reiniciar_mic = OuvinteVAD is not None and not args.no_mic and not args.mic_mock
+
+    def trocar_mic(fonte):
+        """Passa a escutar de `fonte` ("xtion" ou "embutido"). Levanta ErroDeMic se nao abrir."""
+        velho = mic.ouvinte
+        mic.ouvinte = None
+        if transcritor is not None:
+            transcritor.trocar_ouvinte(None)
+        if velho is not None:
+            velho.parar()                      # solta o dispositivo antes de abrir o outro
+        novo = criar_ouvinte(fonte)
+        mic.ouvinte = novo
+        if transcritor is not None:
+            transcritor.trocar_ouvinte(novo)
+        return novo
+
+    def vigiar_mic():
+        """Modo auto: se o microfone do Xtion cair de vez (o audio USB dele trava a cada
+        reinicio do app e so volta com replug), passa sozinho pro microfone embutido do PC."""
+        sem_audio_desde = None
+        while True:
+            time.sleep(2.0)
+            o = mic.ouvinte
+            if mic.modo != "auto" or mic.fonte != "xtion":
+                sem_audio_desde = None
+                continue
+            motivo = None
+            if o is None:
+                motivo = "sem ouvinte"
+            elif not o.estado()[3]:
+                motivo = "o arecord desistiu"
+            elif o.falhas_seguidas >= 3:
+                motivo = "o arecord caiu %d vezes" % o.falhas_seguidas
+            elif len(o.amostras_recentes()) == 0:
+                sem_audio_desde = sem_audio_desde or time.time()
+                if time.time() - sem_audio_desde > 12:
+                    motivo = "nenhum audio chegou em 12 s"
+            else:
+                sem_audio_desde = None
+            if motivo is None:
+                continue
+            sem_audio_desde = None
+            try:
+                trocar_mic("embutido")
+                print("[mic] Xtion falhou (%s); usando o microfone embutido do PC" % motivo, flush=True)
+                if painel_log is not None:
+                    painel_log.evento("mic", "Xtion falhou: usando o microfone embutido", "WARN")
+            except Exception as e:
+                print("AVISO: o microfone embutido nao abriu (%s)" % e, file=sys.stderr)
+                time.sleep(10)
+
+    if pode_reiniciar_mic:
+        threading.Thread(target=vigiar_mic, daemon=True).start()
     servidor = ServidorControle()
     registrar_comandos(servidor, args, saudador, mic, transcritor, conversa,
-                       leitor_depth, detector,
+                       leitor_depth, rosto,
+                       criar_detector=lambda: criar_detector_rosto(args.face_size, args.face_conf),
+                       corpo=corpo_h, criar_corpo=criar_corpo,
                        criar_ouvinte=criar_ouvinte if pode_reiniciar_mic else None,
-                       erro_de_mic=ErroDeMic)
+                       erro_de_mic=ErroDeMic, presenca=presenca,
+                       trocar_mic=trocar_mic if pode_reiniciar_mic else None)
     try:
         servidor.iniciar()
     except OSError as e:
@@ -726,6 +890,8 @@ def main():
                 t0 = marca("resize", t0)
 
                 alvos = []
+                distancias = None
+                detector = rosto.detector
                 if detector:
                     # o YOLO recebe o frame da camera (reduzido la dentro); o rastreio
                     # por fluxo optico roda a cada frame. Caixas voltam em coordenadas
@@ -737,6 +903,40 @@ def main():
                     alvos = [(i, (int(x * ex), int(y * ey), int(w * ex), int(h * ey)), idade)
                              for (i, (x, y, w, h), idade) in caixas]
                     distancias = None
+                    if medidor is not None and leitor_depth is not None and caixas:
+                        # objeto na frente do rosto (celular/mao): a profundidade da caixa salta
+                        # de repente (rosto a 2,7 m, celular a 0,5 m). O fluxo optico gruda no
+                        # objeto e arrasta a caixa; aqui ela e descartada.
+                        try:
+                            mapa0 = leitor_depth.mapa()
+                            if mapa0 is not None:
+                                fx0, fy0 = mapa0.shape[1] / bruto.shape[1], mapa0.shape[0] / bruto.shape[0]
+                                for (i, (x, y, w, h), _i) in caixas:
+                                    mm = profundidade_mediana_mm(mapa0, (x * fx0, y * fy0, w * fx0, h * fy0))
+                                    ref = ref_prof.get(i)
+                                    if mm is None:
+                                        continue
+                                    if ref is None:
+                                        ref_prof[i] = mm
+                                    elif abs(mm - ref) > max(400.0, 0.3 * ref):
+                                        saltos = ref_saltos.get(i, 0) + 1
+                                        ref_saltos[i] = saltos
+                                        if saltos >= 2 and detector.descartar(i):
+                                            if painel_log is not None:
+                                                painel_log.evento("face", "alvo %02d descartado: objeto a %.1f m na frente" % (i, mm / 1000.0), "WARN")
+                                            ref_prof.pop(i, None)
+                                            ref_saltos.pop(i, None)
+                                    else:
+                                        ref_prof[i] = ref + 0.15 * (mm - ref)
+                                        ref_saltos[i] = 0
+                                vivos = {i for (i, _, _) in caixas}
+                                for k in [k for k in ref_prof if k not in vivos]:
+                                    ref_prof.pop(k, None)
+                                    ref_saltos.pop(k, None)
+                                caixas = [c for c in caixas if c[0] in {t[0] for t in detector.alvos()}]
+                                alvos = [a for a in alvos if a[0] in {c[0] for c in caixas}]
+                        except Exception as e:
+                            print(f"AVISO: checagem de profundidade falhou ({e})", file=sys.stderr)
                     if medidor is not None:
                         try:
                             mapa = leitor_depth.mapa()
@@ -750,6 +950,47 @@ def main():
                             print(f"AVISO: falha lendo profundidade ({e})", file=sys.stderr)
                     saudador.atualizar(distancias)
                     desenhar_alvos_hud(cor, alvos, distancias)
+                    if painel_log is not None:
+                        atuais = {i for (i, _, _) in alvos}
+                        for i in sorted(atuais - ids_log["ids"]):
+                            d = (distancias or {}).get(i)
+                            painel_log.evento("face", "alvo %02d adquirido%s" % (
+                                i, " a %.2f m" % d if d else ""))
+                        for i in sorted(ids_log["ids"] - atuais):
+                            painel_log.evento("face", "alvo %02d perdido" % i, "WARN")
+                        ids_log["ids"] = atuais
+                corpo = corpo_h.detector
+                if corpo is not None:
+                    corpo.submit(bruto)
+                    poses = corpo.poses()
+                    if poses and corpo_h.dist_max:
+                        # so conta quem esta a ate dist_max (profundidade no meio dos ombros); sem
+                        # leitura de profundidade nao da pra provar que esta longe: fica
+                        mapa_c = leitor_depth.mapa() if leitor_depth is not None else None
+                        poses = [p for p in poses
+                                 if profundidade_corpo_m(mapa_c, p) is None
+                                 or profundidade_corpo_m(mapa_c, p) <= corpo_h.dist_max]
+                    corpo_h.visiveis = len(poses)       # o `status` mostra a contagem ja filtrada por distancia
+                    desenhar_corpos(cor, poses)
+                    if painel_log is not None and len(poses) != n_corpos["n"]:
+                        painel_log.evento("pose", "%d corpo(s) detectado(s)" % len(poses))
+                    n_corpos["n"] = len(poses)
+                else:
+                    poses = []
+                    if n_corpos["n"]:
+                        n_corpos["n"] = 0
+                if presenca is not None:
+                    mapa_p = leitor_depth.mapa() if leitor_depth is not None else None
+                    presenca.atualizar(
+                        [(distancias or {}).get(i) for (i, _, _) in alvos],
+                        [profundidade_corpo_m(mapa_p, p) for p in poses],
+                        detectores_ligados=(detector is not None) or (corpo is not None))
+                    agora_p = presenca.presente() if presenca.ativo else None
+                    if painel_log is not None and agora_p != estado_pres["v"] and estado_pres["v"] is not None \
+                            and agora_p is not None:
+                        painel_log.evento("presen", "alguem na frente" if agora_p else
+                                          "ninguem na frente: ignorando a fala", "INFO" if agora_p else "WARN")
+                    estado_pres["v"] = agora_p
                 hud.desenhar(cor, len(alvos), detector is not None)
                 t0 = marca("hud", t0)
 
@@ -757,6 +998,8 @@ def main():
                 ouvinte_atual = mic.ouvinte
                 if ouvinte_atual is not None:
                     quadro = compor_hud_transparente(quadro, visual_som, ouvinte_atual, canto=args.corner)
+                if painel_log is not None:
+                    quadro = painel_log.desenhar(quadro)
                 if cliente_chat:
                     quadro = desenhar_chat(quadro, cliente_chat.mensagens())
                 if transcritor:
@@ -826,8 +1069,10 @@ def main():
         parar.set()
         servidor.parar()
         produtor.join(timeout=2)
-        if detector:
-            detector.parar()
+        if rosto.detector:
+            rosto.detector.parar()
+        if corpo_h.detector is not None:
+            corpo_h.detector.parar()
         if cliente_chat:
             cliente_chat.parar()
         if conversa:

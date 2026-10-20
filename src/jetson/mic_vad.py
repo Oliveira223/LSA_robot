@@ -20,6 +20,7 @@ Uso (a partir de src/):
 import array
 import audioop
 import io
+import os
 import queue
 import subprocess
 import threading
@@ -33,10 +34,16 @@ CANAIS = 2
 LARGURA = 2  # bytes por amostra (S16_LE)
 
 GANHO_PADRAO = 1700       # 0-4182; default de fabrica (3576) satura em voz normal
-LIMIAR_FALA = 600         # RMS acima disso = "esta falando" (ajuste se precisar)
+LIMIAR_FALA = 600         # RMS minimo pra "esta falando" (sala silenciosa)
+# Com gente conversando em volta o fundo fica em 500-2000 de RMS e passava do
+# limiar fixo o tempo todo: a frase so fechava no teto de 20 s (visto 2026-10-01).
+# Agora o limiar acompanha o ambiente: FATOR_AMBIENTE x mediana do volume nos
+# ultimos AMBIENTE_S (nunca abaixo de LIMIAR_FALA), congelado durante a frase.
+FATOR_AMBIENTE = 2.5
+AMBIENTE_S = 3.0
 SILENCIO_S = 0.8          # silencio continuo por isso pra fechar a frase
 PRE_ROLL_S = 0.3          # comeco preservado antes do limiar disparar
-MAX_FALA_S = 20.0         # teto de seguranca — fecha a frase mesmo sem silencio
+MAX_FALA_S = 10.0         # teto de seguranca — fecha a frase mesmo sem silencio
 CHUNK_S = 0.05            # granularidade de leitura/deteccao (~50 ms)
 HISTORICO_AUDIO_S = 2.0   # quanto de audio cru fica disponivel pra HUD (forma de onda)
 N_CHUNKS_HISTORICO = max(1, int(HISTORICO_AUDIO_S / CHUNK_S))
@@ -57,18 +64,38 @@ TIMEOUT_CMD_S = 3  # arecord/pactl/amixer as vezes travam de verdade nessa
                     # aqui, um comando travado prendia o app inteiro pra
                     # sempre, antes ate de abrir a janela.
 
+TIMEOUT_PREPARO_MIC_S = 20
 
-def _rodar(cmd):
+
+def _rodar(cmd, timeout=TIMEOUT_CMD_S):
     try:
         return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               timeout=TIMEOUT_CMD_S)
+                               timeout=timeout)
     except subprocess.TimeoutExpired:
         print("[mic_vad] comando travou (%s) — seguindo com o fallback"
               % " ".join(cmd), flush=True)
         return None
 
 
+# Microfone EMBUTIDO do PC (reserva quando o do Xtion/PrimeSense trava: o audio USB dele
+# trava a cada reinicio do app e so volta com replug do cabo). ALSA direto pelo NOME da
+# placa (o numero muda), com o ganho de captura baixado: no padrao (100% + boost) o
+# microfone embutido satura mesmo em voz normal.
+CARD_EMBUTIDO = os.environ.get("LSA_MIC_EMB_CARD", "PCH")
+DEVICE_EMBUTIDO = os.environ.get("LSA_MIC_EMB_DEVICE", "plughw:CARD=%s,DEV=0" % CARD_EMBUTIDO)
+GANHO_EMBUTIDO_PCT = int(os.environ.get("LSA_MIC_EMB_GANHO", "80"))   # % do controle "Capture"
+
+
+def _ajustar_ganho_embutido():
+    for controle, valor in (("Capture", "%d%%" % GANHO_EMBUTIDO_PCT), ("Internal Mic Boost", "0"),
+                            ("Headset Mic Boost", "0")):
+        _rodar(["amixer", "-q", "-c", CARD_EMBUTIDO, "sset", controle, valor])
+
+
 def _achar_card(nome_dispositivo=NOME_DISPOSITIVO_PADRAO, fallback=CARD_FALLBACK):
+    """Numero da placa ALSA do dispositivo. Se `arecord -l` roda mas nao lista
+    o dispositivo (ex.: PC sem PrimeSense), devolve None: quem chama usa o
+    microfone padrao do sistema em vez de chutar a placa da Jetson."""
     resultado = _rodar(["arecord", "-l"])
     if resultado is None:
         return fallback
@@ -77,6 +104,8 @@ def _achar_card(nome_dispositivo=NOME_DISPOSITIVO_PADRAO, fallback=CARD_FALLBACK
         if linha.startswith("card ") and nome_dispositivo in linha:
             # "card 2: Device [USB Device 0x1d27:0x601], device 0: ..."
             return linha.split()[1].rstrip(":")
+    if saida.strip():
+        return None
     return fallback
 
 
@@ -105,8 +134,14 @@ def preparar_mic(nome_dispositivo=NOME_DISPOSITIVO_PADRAO, card_fallback=CARD_FA
     que a taxa ja foi configurada uma vez, o driver nao pede de novo e o
     arecord abre normalmente mesmo com o video ligado."""
     card = _achar_card(nome_dispositivo, card_fallback)
+    if card is None:        # sem PrimeSense (PC): o mic padrao nao precisa de preparo
+        return
+    # timeout maior que o padrao: logo apos o USB reenumerar o driver demora a
+    # responder e abortar aqui em 3 s deixava a taxa sem configurar (mic offline
+    # pro resto da sessao, visto 2026-09-30).
     _rodar(["arecord", "-q", "-D", "hw:%s,0" % card, "-f", "S16_LE",
-            "-r", str(TAXA), "-c", str(CANAIS), "-d", "1", "-t", "raw", "/dev/null"])
+            "-r", str(TAXA), "-c", str(CANAIS), "-d", "1", "-t", "raw", "/dev/null"],
+           timeout=TIMEOUT_PREPARO_MIC_S)
 
 
 def _aplicar_ganho(card, ganho, numids=NUMIDS_GANHO_PADRAO):
@@ -131,14 +166,29 @@ class OuvinteVAD:
                  ganho=GANHO_PADRAO, device=None,
                  nome_dispositivo=NOME_DISPOSITIVO_PADRAO,
                  card_fallback=CARD_FALLBACK, source_fallback=SOURCE_FALLBACK,
-                 numids_ganho=NUMIDS_GANHO_PADRAO):
+                 numids_ganho=NUMIDS_GANHO_PADRAO, embutido=False):
         # nome_dispositivo/fallbacks/numids_ganho existem pra reaproveitar essa
         # classe com OUTRO sensor (ex.: jetson/kinect_mic.py) sem duplicar toda
         # a logica de VAD/reconexao/buffer — so muda como acha a placa e como
         # aplica o ganho. Os padroes preservam o comportamento original (PrimeSense).
-        self._card = _achar_card(nome_dispositivo, card_fallback)
-        self._source = _achar_source(nome_dispositivo, source_fallback)
-        self._device = device or ("hw:%s,0" % self._card)
+        self.embutido = embutido
+        self._card = None if embutido else _achar_card(nome_dispositivo, card_fallback)
+        if embutido:
+            # microfone do proprio PC: sem PrimeSense, sem suspend-source, ganho do ALSA
+            self._source = None
+            numids_ganho = None
+            self._device = device or DEVICE_EMBUTIDO
+            _ajustar_ganho_embutido()
+        elif self._card is None:
+            # PC (sem PrimeSense): usa o microfone padrao do sistema (PipeWire/Pulse
+            # via ALSA "default"), sem mexer em ganho nem suspender fontes.
+            # LSA_MIC_DEVICE escolhe outro (ex.: "plughw:0,0").
+            self._source = None
+            numids_ganho = None
+            self._device = device or os.environ.get("LSA_MIC_DEVICE", "default")
+        else:
+            self._source = _achar_source(nome_dispositivo, source_fallback)
+            self._device = device or ("hw:%s,0" % self._card)
         self._limiar = limiar_fala
         self._silencio_s = silencio_s
         self._ganho = ganho
@@ -158,12 +208,14 @@ class OuvinteVAD:
         self._nivel_atual = 0
         self._gravando_atual = False
         self._vivo = True   # False quando desiste de religar o arecord (vira "MIC OFFLINE" na HUD)
+        self.falhas_seguidas = 0   # quedas seguidas do arecord (zera quando volta a chegar audio)
         self._historico_audio = deque(maxlen=N_CHUNKS_HISTORICO)  # amostras cruas p/ forma de onda
 
         try:
             self._proc = self._abrir_arecord()
         except OSError as e:
-            _rodar(["pactl", "suspend-source", self._source, "0"])
+            if self._source:
+                _rodar(["pactl", "suspend-source", self._source, "0"])
             raise ErroDeMic("nao foi possivel abrir 'arecord': %s" % e) from e
 
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -220,6 +272,8 @@ class OuvinteVAD:
         buffer = []
         silencio_acumulado = 0.0
         duracao_fala = 0.0
+        ambiente = deque(maxlen=int(AMBIENTE_S / CHUNK_S))
+        limiar_base = self._limiar
 
         reconexoes = 0
         while self._rodando:
@@ -233,6 +287,7 @@ class OuvinteVAD:
                 if not self._rodando:
                     break
                 reconexoes += 1
+                self.falhas_seguidas = reconexoes
                 print("[mic_vad] arecord caiu (%s) — tentativa %d/%d de religar"
                       % (erro or "sem stderr", reconexoes, self.MAX_RECONEXOES), flush=True)
                 if reconexoes > self.MAX_RECONEXOES:
@@ -251,6 +306,7 @@ class OuvinteVAD:
                     continue
                 continue
             reconexoes = 0
+            self.falhas_seguidas = 0
             nivel = audioop.rms(pedaco, LARGURA)
             mono = array.array("h")
             mono.frombytes(audioop.tomono(pedaco, LARGURA, 0.5, 0.5))
@@ -259,7 +315,14 @@ class OuvinteVAD:
                 self._gravando_atual = gravando
                 self._historico_audio.append(mono)
 
+            # o ambiente e medido sempre (inclusive gravando): com conversa em volta
+            # o detector grava sem parar e nunca juntaria AMBIENTE_S so de fundo
+            ambiente.append(nivel)
             if not gravando:
+                if len(ambiente) >= ambiente.maxlen // 3:
+                    mediana = sorted(ambiente)[len(ambiente) // 2]
+                    with self._estado_lock:
+                        self._limiar = max(limiar_base, int(FATOR_AMBIENTE * mediana))
                 pre_roll.append(pedaco)
                 if len(pre_roll) > tam_pre_roll:
                     pre_roll.pop(0)

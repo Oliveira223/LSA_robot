@@ -457,3 +457,14 @@ de lá como de costume.
 - Decidir o destino do WIP `mic_vad.py`/`chat_client.py` (caminho
   original, mic na Jetson) — manter como alternativa ou descartar depois
   que a inversão for validada.
+
+---
+
+## 2026-10-02
+
+### Migração das duas Jetsons para o Dell all-in-one (x86_64)
+
+Tudo numa máquina só; ver [docs/dell-all-in-one.md](docs/dell-all-in-one.md). Webcam no lugar da
+PrimeSense, Ollama + Piper + Vosk locais, serviços systemd de usuário. Validado sem tela/áudio:
+YOLO detecta rosto, Vosk transcreve, Ollama responde pelo `servidor_conversa` e o app recebe texto+WAV.
+Falta o passo com root (desktop/áudio) pra validar janela, mic e alto-falante.
